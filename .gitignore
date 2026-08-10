@@ -1,0 +1,43 @@
+.pio/
+.pio/generated/
+.embeddedskills/
+.idea/
+.vscode/
+tools/.venv/
+__pycache__/
+*.py[cod]
+
+# User-provided or generated disk/flash data
+hd.img
+*.upload
+*.backup
+ram.bin
+
+# Local backups and diagnostic builds
+backup-*.bin
+macplus-debug.bin
+macplus-fix.bin
+macplus-trace.bin
+macplus-installer.bin
+macplus-test.bin
+macplus.bin
+macplus-standalone.bin
+macplus-lite.bin
+macplus-standard.bin
+macplus-full.bin
+partitions.csv
+partitions-full.csv
+classic-apps/
+HANDOVER.md
+STANDALONE.md
+SD卡说明.txt
+src/installdisk.cpp
+src/installdisk.h
+tools/make_hd.py
+tools/make_rom_240.py
+roms/macplus-patched-240.rom
+
+# PlatformIO and temporary build output
+.sconsign*
+.pioenvs/
+.piolibdeps/
