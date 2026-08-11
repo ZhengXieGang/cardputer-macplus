@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "iwm.h"
+#include "hd.h"
 
 #define IWM_CA0     (1 << 0)
 #define IWM_CA1     (1 << 1)
@@ -284,10 +285,16 @@ static void writeDriveRegister(void) {
         }
         break;
     case 3:
-        if (value) {
+        if (value && diskInserted) {
             diskInserted = 0;
             motorOn = 0;
             diskSwitched = 1;
+            // Finder may have dirtied the system disk while the removable
+            // volume was being used.  Commit that cache before acknowledging
+            // eject so an immediate power-off cannot lose the boot volume.
+            const int flushOk = hdFlushNow();
+            printf("IWM: disk ejected; HD cache %s\n",
+                   flushOk ? "flushed" : "flush FAILED");
         }
         break;
     case 4:

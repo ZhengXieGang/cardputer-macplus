@@ -34,7 +34,9 @@ static constexpr size_t HD_SD_IO_CHUNK_BYTES = 8 * 1024;
 // budget flat while allowing raw flash writes after startup.
 static constexpr size_t HD_CACHE_BLOCK_BYTES = 4096;
 static constexpr size_t HD_CACHE_BLOCK_COUNT = 1;
-static constexpr uint32_t HD_FLUSH_INTERVAL_MS = 1000;
+// Keep the power-loss window short.  Reads still come from the mapped Flash
+// image; this only affects the low-priority write-back task.
+static constexpr uint32_t HD_FLUSH_INTERVAL_MS = 250;
 
 // Raw flash cache for the SCSI disk image.  The first boot with the SD card
 // copies /sd/hd.img here; afterwards all reads come from this memory-mapped
@@ -52,6 +54,16 @@ static constexpr uint32_t HD_RAW_FLASH_VALID_MAGIC = 0x4D414344; // "MACD"
 static constexpr uint32_t HD_RAW_FLASH_PINNED_MAGIC = 0x4D414357; // "MACW"
 static constexpr uint32_t HD_RAW_FLASH_METADATA_BYTES =
     MACPLUS_HD_METADATA_BYTES;
+// The metadata sector also contains a tiny write-ahead journal.  A pending
+// record means the last 4 KiB write may have been interrupted; boot must then
+// rebuild the cache from /sd/hd.img instead of trusting a torn block.
+static constexpr uint32_t HD_RAW_FLASH_JOURNAL_OFFSET = 32U;
+static constexpr uint32_t HD_RAW_FLASH_JOURNAL_RECORD_BYTES = 16U;
+static constexpr uint32_t HD_RAW_FLASH_JOURNAL_SLOTS =
+    (HD_RAW_FLASH_METADATA_BYTES - HD_RAW_FLASH_JOURNAL_OFFSET) /
+    HD_RAW_FLASH_JOURNAL_RECORD_BYTES;
+static constexpr uint32_t HD_RAW_FLASH_JOURNAL_PENDING = 0xF0F0F0F0U;
+static constexpr uint32_t HD_RAW_FLASH_JOURNAL_COMMITTED = 0xF0F00000U;
 static constexpr uint32_t INSTALL_FLASH_ADDR = 0x720000U;
 static constexpr uint32_t INSTALL_400K_BYTES =
     MACPLUS_INSTALL_400K_BYTES;
@@ -84,6 +96,22 @@ struct RawFlashMetadata {
     uint32_t fingerprint;
     uint32_t contentCrc;
 };
+
+static uint32_t hdCrc32(const uint8_t *data, size_t len, uint32_t crc);
+
+struct RawFlashJournalRecord {
+    uint32_t sequence;
+    uint32_t blockIndex;
+    uint32_t recordCrc;
+    uint32_t state;
+};
+
+static uint32_t rawFlashJournalCrc(uint32_t sequence,
+                                   uint32_t blockIndex) {
+    uint32_t values[2] = {sequence, blockIndex};
+    return hdCrc32(reinterpret_cast<const uint8_t *>(values),
+                   sizeof(values), 0);
+}
 
 static bool selectHdCacheStorage(uint32_t requiredBytes) {
     hdCachePartition = esp_partition_find_first(
@@ -246,6 +274,114 @@ static bool writeRawFlashMetadata(uint32_t magic, uint32_t imageBytes,
            writeHdCache(hdCacheImageMax,
                         reinterpret_cast<const uint8_t *>(&metadata),
                         sizeof(metadata));
+}
+
+static bool rawFlashJournalRecordIsErased(
+    const RawFlashJournalRecord &record) {
+    const uint32_t *words = reinterpret_cast<const uint32_t *>(&record);
+    return words[0] == 0xFFFFFFFFU && words[1] == 0xFFFFFFFFU &&
+           words[2] == 0xFFFFFFFFU && words[3] == 0xFFFFFFFFU;
+}
+
+static bool rawFlashJournalRecordIsValid(
+    const RawFlashJournalRecord &record) {
+    return (record.state == HD_RAW_FLASH_JOURNAL_PENDING ||
+            record.state == HD_RAW_FLASH_JOURNAL_COMMITTED) &&
+           record.recordCrc == rawFlashJournalCrc(record.sequence,
+                                                   record.blockIndex);
+}
+
+// Return true when the newest journal entry is not a completed transaction.
+// A damaged/non-erased entry is treated conservatively as pending.
+static bool rawFlashJournalHasPending(void) {
+    uint32_t newestSequence = 0;
+    uint32_t newestState = 0;
+    bool haveNewest = false;
+    int lastNonErasedSlot = -1;
+    int lastDamagedSlot = -1;
+    for (uint32_t slot = 0; slot < HD_RAW_FLASH_JOURNAL_SLOTS; ++slot) {
+        RawFlashJournalRecord record = {};
+        const uint32_t offset = hdCacheImageMax +
+                                HD_RAW_FLASH_JOURNAL_OFFSET +
+                                slot * HD_RAW_FLASH_JOURNAL_RECORD_BYTES;
+        if (!hdRawFlashStorageRead(offset, reinterpret_cast<uint8_t *>(&record),
+                                   sizeof(record))) {
+            return true;
+        }
+        if (rawFlashJournalRecordIsErased(record)) continue;
+        lastNonErasedSlot = static_cast<int>(slot);
+        if (!rawFlashJournalRecordIsValid(record)) {
+            lastDamagedSlot = static_cast<int>(slot);
+            continue;
+        }
+        if (!haveNewest ||
+            static_cast<int32_t>(record.sequence - newestSequence) > 0) {
+            haveNewest = true;
+            newestSequence = record.sequence;
+            newestState = record.state;
+        }
+    }
+    return (lastDamagedSlot == lastNonErasedSlot) || (haveNewest &&
+                       newestState != HD_RAW_FLASH_JOURNAL_COMMITTED);
+}
+
+static bool rawFlashJournalAppend(uint32_t blockIndex, uint32_t state) {
+    if (state != HD_RAW_FLASH_JOURNAL_PENDING &&
+        state != HD_RAW_FLASH_JOURNAL_COMMITTED) {
+        return false;
+    }
+
+    int freeSlot = -1;
+    uint32_t newestSequence = 0;
+    bool haveSequence = false;
+    for (uint32_t slot = 0; slot < HD_RAW_FLASH_JOURNAL_SLOTS; ++slot) {
+        RawFlashJournalRecord record = {};
+        const uint32_t offset = hdCacheImageMax +
+                                HD_RAW_FLASH_JOURNAL_OFFSET +
+                                slot * HD_RAW_FLASH_JOURNAL_RECORD_BYTES;
+        if (!hdRawFlashStorageRead(offset, reinterpret_cast<uint8_t *>(&record),
+                                   sizeof(record))) {
+            return false;
+        }
+        if (rawFlashJournalRecordIsErased(record)) {
+            if (freeSlot < 0) freeSlot = static_cast<int>(slot);
+            continue;
+        }
+        if (rawFlashJournalRecordIsValid(record) &&
+            (!haveSequence ||
+             static_cast<int32_t>(record.sequence - newestSequence) > 0)) {
+            newestSequence = record.sequence;
+            haveSequence = true;
+        }
+    }
+
+    if (freeSlot < 0) {
+        // Rotate the journal.  Preserve the current image metadata, then
+        // start the new transaction in the freshly erased sector.
+        RawFlashMetadata metadata = {};
+        if (!readRawFlashMetadata(&metadata) ||
+            !eraseHdCache(hdCacheImageMax, HD_RAW_FLASH_METADATA_BYTES) ||
+            !writeHdCache(hdCacheImageMax,
+                          reinterpret_cast<const uint8_t *>(&metadata),
+                          sizeof(metadata))) {
+            return false;
+        }
+        freeSlot = 0;
+        haveSequence = false;
+    }
+
+    RawFlashJournalRecord record = {
+        haveSequence ? newestSequence + 1U : 1U,
+        blockIndex,
+        0,
+        state,
+    };
+    record.recordCrc = rawFlashJournalCrc(record.sequence, record.blockIndex);
+    const uint32_t offset = hdCacheImageMax + HD_RAW_FLASH_JOURNAL_OFFSET +
+                            static_cast<uint32_t>(freeSlot) *
+                                HD_RAW_FLASH_JOURNAL_RECORD_BYTES;
+    return writeHdCache(offset, reinterpret_cast<const uint8_t *>(&record),
+                        sizeof(record));
 }
 
 static bool readOldRawFlashFooter(uint32_t *magic, uint32_t *fingerprint) {
@@ -842,6 +978,10 @@ static bool prepareRawFlashHd(HdPriv *hd) {
     }
 
     bool valid = hdRawFlashImageIsValid(imageBytes);
+    if (valid && rawFlashJournalHasPending()) {
+        printf("HD: interrupted Flash write detected; restoring from SD\n");
+        valid = false;
+    }
     uint32_t storedMagic = 0;
     uint32_t storedCrc = 0;
     bool haveStored = false;
@@ -1192,18 +1332,45 @@ static bool writeFlashBlock(HdPriv *hd, uint32_t blockIndex,
     return error == ESP_OK;
 }
 
+static bool rawFlashBlockMatches(uint32_t offset, const uint8_t *data) {
+    uint8_t verify[512];
+    for (size_t part = 0; part < HD_CACHE_BLOCK_BYTES; part += sizeof(verify)) {
+        if (!hdRawFlashStorageRead(offset + static_cast<uint32_t>(part),
+                                   verify, sizeof(verify)) ||
+            memcmp(verify, data + part, sizeof(verify)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool flushFlashRawBlock(HdPriv *hd, HdCacheBlock *block) {
     if (hd->flashData == nullptr || block == nullptr || !block->valid ||
         !block->dirty) return false;
 
     const uint32_t offset = block->blockIndex * HD_CACHE_BLOCK_BYTES;
+    if (!rawFlashJournalAppend(block->blockIndex,
+                               HD_RAW_FLASH_JOURNAL_PENDING)) {
+        hd->lastIoError = EIO;
+        return false;
+    }
     esp_err_t error = eraseHdCache(offset, 4096) ? ESP_OK : ESP_FAIL;
     if (error == ESP_OK) {
         error = writeHdCache(offset, block->data, HD_CACHE_BLOCK_BYTES)
             ? ESP_OK : ESP_FAIL;
     }
+    if (error == ESP_OK &&
+        !rawFlashBlockMatches(offset, block->data)) {
+        error = ESP_FAIL;
+    }
     hd->lastIoError = static_cast<uint32_t>(error);
     if (error != ESP_OK) return false;
+
+    if (!rawFlashJournalAppend(block->blockIndex,
+                               HD_RAW_FLASH_JOURNAL_COMMITTED)) {
+        hd->lastIoError = EIO;
+        return false;
+    }
 
     // PINNED images deliberately skip the full-image CRC at boot.  Do not
     // rescan a multi-megabyte disk and erase the metadata sector after every
@@ -1526,13 +1693,17 @@ static void unlockHd(HdPriv *hd) {
 }
 
 
-void hdFlushNow(void) {
+int hdFlushNow(void) {
     HdPriv *hd = activeHd;
-    if (hd != nullptr && hd->mutex == nullptr) return;
+    if (hd == nullptr || hd->mutex == nullptr) return hd == nullptr ? 1 : 0;
+    bool ok = true;
     if (hd != nullptr && lockHd(hd)) {
-        flushCache(hd);
+        ok = flushCache(hd);
         unlockHd(hd);
+    } else {
+        ok = false;
     }
+    return ok ? 1 : 0;
 }
 
 void hdFlushIfDue(void) {
@@ -1843,8 +2014,10 @@ SCSIDevice *hdCreate(void) {
         printf("HD: Flash cache unavailable; SD random I/O disabled\n");
     }
 
-    // Fall back to flash partition
-    if (!hd->fp && hd->flashData == nullptr) {
+    // A named macplus partition is the protected raw-cache container, not a
+    // second SCSI image.  Never expose it wholesale after a failed cache
+    // validation; doing so would let a torn block reach the boot driver.
+    if (!hd->fp && hd->flashData == nullptr && !hdCacheUsesPartition) {
         hd->part=esp_partition_find_first((esp_partition_type_t)0x40, (esp_partition_subtype_t)0x02, NULL);
         if (hd->part==0) {
             printf("HD: No SD card image and no flash partition!\n");
@@ -1860,6 +2033,11 @@ SCSIDevice *hdCreate(void) {
                 printf("HD: refusing blank/invalid flash HD partition\n");
             }
         }
+    } else if (!hd->fp && hd->flashData == nullptr && hdCacheUsesPartition) {
+        hd->ready = false;
+        hd->size = 0;
+        hd->lastIoError = EIO;
+        printf("HD: protected Flash cache unavailable; refusing raw partition fallback\n");
     }
 
     if (hd->ready) prepareInstallVolume();

@@ -41,7 +41,7 @@ int32_t hdGetOfflineFailureSeekResult(void);
 int32_t hdGetOfflineFailureFlushResult(void);
 int32_t hdGetOfflineFailureStreamError(void);
 int32_t hdGetOfflineFailureErrno(void);
-void hdFlushNow(void);
+int hdFlushNow(void);
 void hdFlushIfDue(void);
 void hdInvalidateRawCache(void);
 bool hdRawFlashRangeIsSafe(uint32_t address, uint32_t bytes);
