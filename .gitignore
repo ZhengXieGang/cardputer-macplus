@@ -22,8 +22,7 @@ macplus-installer.bin
 macplus-test.bin
 macplus.bin
 macplus-standalone.bin
-macplus-lite.bin
-macplus-standard.bin
+macplus-launcher.bin
 macplus-full.bin
 partitions.csv
 partitions-full.csv

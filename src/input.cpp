@@ -89,6 +89,7 @@ uint32_t lastMouseDt = 0;
 uint8_t physicalMacScan[4][14];
 bool fnDown = false;
 bool tcaReady = false;
+uint8_t pendingKeyPress = kNoKey;
 uint32_t tcaEventCount = 0;
 uint32_t tcaReadFailures = 0;
 uint32_t tcaLastInitMs = 0;
@@ -249,7 +250,6 @@ static void handleTcaEvent(uint8_t event, bool routeToMac) {
     const uint8_t code = event & 0x7F;
     if (code == 0 || code > 70) return;
     physicalKeysDown[code - 1] = down;
-    if (!routeToMac) return;
     const uint8_t raw = code - 1;
     const uint8_t rawRow = raw / 10;
     const uint8_t rawCol = raw % 10;
@@ -269,10 +269,13 @@ static void handleTcaEvent(uint8_t event, bool routeToMac) {
         scancode = fnDown && kFnScanMatrix[row][col] != kNoKey
             ? kFnScanMatrix[row][col] : kMacScanMatrix[row][col];
         physicalMacScan[row][col] = scancode;
+        if (!routeToMac && pendingKeyPress == kNoKey) {
+            pendingKeyPress = scancode;
+        }
     } else {
         physicalMacScan[row][col] = kNoKey;
     }
-    if (scancode != kNoKey) pushKey(scancode, down);
+    if (routeToMac && scancode != kNoKey) pushKey(scancode, down);
 }
 
 static void pollKeyboard(bool routeToMac) {
@@ -474,6 +477,7 @@ void cardputerInputInit() {
     webComboActive = false;
     webComboTriggered = false;
     fnDown = false;
+    pendingKeyPress = kNoKey;
     tcaReady = false;
     tcaEventCount = 0;
     tcaReadFailures = 0;
@@ -519,6 +523,13 @@ bool cardputerInputAnyKeyPressed() {
         if (down) return true;
     }
     return false;
+}
+
+uint8_t cardputerInputReadKeyPress() {
+    pollKeyboard(false);
+    const uint8_t key = pendingKeyPress;
+    pendingKeyPress = kNoKey;
+    return key;
 }
 
 void cardputerInputImuStatus() {

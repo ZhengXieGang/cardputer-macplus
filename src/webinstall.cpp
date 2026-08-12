@@ -5,6 +5,7 @@
 #include <esp_spi_flash.h>
 #include <new>
 #include <errno.h>
+#include <sys/stat.h>
 
 #include "hardware_config.h"
 #include "input.h"
@@ -17,20 +18,15 @@ extern "C" {
 #include "tme/hd.h"
 }
 
-// Keep validation limits in sync with the HD cache implementation. The base
-// address is selected at runtime: a protected "macplus" data partition wins,
-// otherwise a collision-checked raw-flash range is used.
 static constexpr uint32_t WEB_IMAGE_MIN_BYTES = 0xC600;
-static constexpr uint32_t WEB_IMAGE_MAX_BYTES =
-    MACPLUS_HD_FULL_MAX_IMAGE_BYTES;
-static constexpr uint32_t WEB_VALID_MAGIC = 0x4D414344; // "MACD"
 static constexpr uint32_t WEB_PINNED_MAGIC = 0x4D414357; // "MACW"
 static constexpr uint32_t INSTALL_400K_BYTES =
     MACPLUS_INSTALL_400K_BYTES;
 static constexpr uint32_t INSTALL_800K_BYTES =
     MACPLUS_INSTALL_800K_BYTES;
-static constexpr uint32_t INSTALL_ERASE_BYTES = INSTALL_800K_BYTES + 4096;
-static constexpr uint32_t INSTALL_VALID_MAGIC = 0x4E545349; // "INST"
+static constexpr const char *INSTALL_PATH = "/sd/macplus-install.img";
+static constexpr const char *INSTALL_TEMP_PATH = "/sd/macplus-install.upload";
+static constexpr const char *INSTALL_BACKUP_PATH = "/sd/macplus-install.backup";
 
 static WebServer *webServer = nullptr;
 static bool uploadError = false;
@@ -54,7 +50,6 @@ static uint32_t uploadInputOffset = 0;
 static bool uploadIsDc42 = false;
 static uint8_t dc42Header[84];
 static FILE *sdFile = nullptr;
-static bool sdMirrorRequired = false;
 static bool accessPointReady = false;
 static bool accessPointAttempted = false;
 static uint32_t lastDisplayUpdateMs = 0;
@@ -73,8 +68,8 @@ static const char INSTALL_PAGE[] PROGMEM = R"HTML(<!doctype html>
 <header class="titlebar"><span class="close" aria-hidden="true"></span><h1 id="title" data-t="title">MacPlus Transfer</h1><span></span></header>
 <div class="body"><p class="intro" data-t="intro">Upload software disks directly to this Cardputer.</p>
 <div class="online"><span class="lamp"></span><span data-t="online">Connected to MacPlus-Install</span></div>
-<form class="disk" action="/upload/hd" data-min="50688" data-max="5844992" data-step="512">
-<h2 data-t="hd">System Hard Disk</h2><p data-t="hdInfo">Macintosh partition image, 512-byte aligned, up to 5,844,992 bytes (Full; Standard: 4,243,456)</p>
+<form class="disk" action="/upload/hd" data-min="50688" data-max="0" data-step="512">
+<h2 data-t="hd">System Hard Disk</h2><p data-t="hdInfo">Reading available Flash capacity...</p>
 <div class="actions"><label class="pick"><input type="file" name="hdimg" accept=".img"><span data-t="choose">Choose Image</span></label><span class="filename" data-t="none">No file selected</span><button class="send" type="submit" data-t="upload">Upload</button></div></form>
 <form class="disk" action="/upload/install" data-sizes="409600,819200,409684,419284,819284,838484">
 <h2 data-t="install">Software Disk</h2><p data-t="installInfo">400K or 800K HFS/MFS image, raw or Disk Copy 4.2</p>
@@ -83,10 +78,10 @@ static const char INSTALL_PAGE[] PROGMEM = R"HTML(<!doctype html>
 <p class="note" data-t="note">The device verifies the image and restarts automatically after a successful upload.</p>
 </div></section></main>
 <script>
-const T={en:{menu:"File Transfer",title:"MacPlus Transfer",intro:"Upload software disks directly to this Cardputer.",online:"Connected to MacPlus-Install",hd:"System Hard Disk",hdInfo:"Macintosh partition image, 512-byte aligned, up to 5,844,992 bytes (Full; Standard: 4,243,456)",install:"Software Disk",installInfo:"400K or 800K HFS/MFS image, raw or Disk Copy 4.2",choose:"Choose Image",none:"No file selected",upload:"Upload",status:"Transfer Status",note:"After a software-disk upload, open its Finder icon and copy the app to the system disk.",ready:"Ready.",badHd:"Invalid hard disk image size. Use 512-byte alignment from {min} to {max} bytes. Standard devices accept up to 4,243,456 bytes.",badInstall:"Software disk must be 400K (409,600) or 800K (819,200), raw or Disk Copy 4.2.",prepare:"Preparing Flash...",sending:"Uploading {name}: {percent}%",verify:"Upload sent. Verifying Flash...",done:"Complete. Restarting MacPlus...",fail:"Upload failed. Check the image and try again."},zh:{menu:"文件传输",title:"MacPlus 传输工具",intro:"把软件磁盘镜像直接上传到这台 Cardputer。",online:"已连接 MacPlus-Install",hd:"系统硬盘",hdInfo:"Macintosh 分区硬盘镜像，512 字节对齐，最大 5,844,992 字节（Full 版；Standard 版最大 4,243,456 字节）",install:"软件安装盘",installInfo:"支持 400K 或 800K HFS/MFS 原始镜像或 Disk Copy 4.2 文件",choose:"选择镜像",none:"未选择文件",upload:"上传",status:"传输状态",note:"上传软件盘后，在 Finder 打开新磁盘图标，把应用复制到系统硬盘。",ready:"准备就绪。",badHd:"系统硬盘镜像大小无效，须为 512 字节对齐，范围 {min} 至 {max} 字节。Standard 设备最大支持 4,243,456 字节。",badInstall:"软件盘必须是 400K（409,600 字节）或 800K（819,200 字节），支持原始镜像或 Disk Copy 4.2。",prepare:"正在准备 Flash...",sending:"正在上传 {name}：{percent}%",verify:"上传完成，正在校验 Flash...",done:"写入完成，正在重启 MacPlus...",fail:"上传失败，请检查镜像后重试。"}};
+const T={en:{menu:"File Transfer",title:"MacPlus Transfer",intro:"Upload disk images directly to this Cardputer.",online:"Connected to MacPlus-Install",hd:"System Hard Disk",hdInfo:"Macintosh partition image, 512-byte aligned, up to {max} bytes on this device",install:"Software Disk",installInfo:"400K or 800K HFS/MFS image, raw or Disk Copy 4.2",choose:"Choose Image",none:"No file selected",upload:"Upload",status:"Transfer Status",note:"After a software-disk upload, open its Finder icon and copy the app to the system disk.",ready:"Ready.",badHd:"Invalid hard disk image size. Use 512-byte alignment from {min} to {max} bytes.",badInstall:"Software disk must be 400K (409,600) or 800K (819,200), raw or Disk Copy 4.2.",prepare:"Preparing storage...",sending:"Uploading {name}: {percent}%",verify:"Upload sent. Verifying...",done:"Complete. Restarting MacPlus...",fail:"Upload failed. Check the image and try again."},zh:{menu:"文件传输",title:"MacPlus 传输工具",intro:"把磁盘镜像直接上传到这台 Cardputer。",online:"已连接 MacPlus-Install",hd:"系统硬盘",hdInfo:"Macintosh 分区硬盘镜像，512 字节对齐；本机最大 {max} 字节",install:"软件安装盘",installInfo:"支持 400K 或 800K HFS/MFS 原始镜像或 Disk Copy 4.2 文件",choose:"选择镜像",none:"未选择文件",upload:"上传",status:"传输状态",note:"上传软件盘后，在 Finder 打开新磁盘图标，把应用复制到系统硬盘。",ready:"准备就绪。",badHd:"系统硬盘镜像大小无效，须为 512 字节对齐，范围 {min} 至 {max} 字节。",badInstall:"软件盘必须是 400K（409,600 字节）或 800K（819,200 字节），支持原始镜像或 Disk Copy 4.2。",prepare:"正在准备存储空间...",sending:"正在上传 {name}：{percent}%",verify:"上传完成，正在校验...",done:"写入完成，正在重启 MacPlus...",fail:"上传失败，请检查镜像后重试。"}};
 const lang=(navigator.language||"").toLowerCase().startsWith("zh")?"zh":"en",t=T[lang],q=s=>document.querySelector(s),all=s=>[...document.querySelectorAll(s)];document.documentElement.lang=lang==="zh"?"zh-CN":"en";q("#lang").textContent=lang==="zh"?"简体中文":"English";all("[data-t]").forEach(e=>e.textContent=t[e.dataset.t]);
 const bar=q("#bar"),fill=q("#fill"),pct=q("#percent"),message=q("#message"),forms=all("form.disk");function setProgress(value,text){value=Math.max(0,Math.min(100,value));fill.style.width=value+"%";pct.textContent=value+"%";bar.setAttribute("aria-valuenow",value);message.textContent=text}function enableForms(on){forms.forEach(f=>f.querySelector(".send").disabled=!on||!f.dataset.valid)}setProgress(0,t.ready);
-forms.forEach(form=>{const input=form.querySelector("input"),name=form.querySelector(".filename"),button=form.querySelector(".send"),sizes=(form.dataset.sizes||"").split(",").filter(Boolean).map(Number),min=Number(form.dataset.min||0),max=Number(form.dataset.max||0),step=Number(form.dataset.step||1),valid=file=>!!file&&(sizes.length?sizes.includes(file.size):file.size>=min&&file.size<=max&&file.size%step===0),bad=()=>sizes.length?t.badInstall:t.badHd.replace("{min}",min.toLocaleString()).replace("{max}",max.toLocaleString());form.dataset.valid="";button.disabled=true;input.addEventListener("change",()=>{const file=input.files[0],ok=valid(file);name.textContent=file?file.name:t.none;form.dataset.valid=ok?"1":"";button.disabled=!ok;setProgress(0,file&&!ok?bad():t.ready)});form.addEventListener("submit",event=>{event.preventDefault();const file=input.files[0];if(!valid(file))return;enableForms(false);setProgress(0,t.prepare);const xhr=new XMLHttpRequest();xhr.open("POST",form.action);xhr.setRequestHeader("Content-Type","application/octet-stream");xhr.upload.onprogress=e=>{if(!e.lengthComputable)return;const p=Math.round(e.loaded*100/e.total);setProgress(p,t.sending.replace("{name}",file.name).replace("{percent}",p))};xhr.upload.onload=()=>setProgress(100,t.verify);xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300)setProgress(100,t.done);else{setProgress(0,t.fail);enableForms(true)}};xhr.onerror=()=>{setProgress(0,t.fail);enableForms(true)};xhr.send(file)})});
+forms.forEach(form=>{const input=form.querySelector("input"),name=form.querySelector(".filename"),button=form.querySelector(".send"),sizes=(form.dataset.sizes||"").split(",").filter(Boolean).map(Number),min=Number(form.dataset.min||0),step=Number(form.dataset.step||1);let max=Number(form.dataset.max||0);const valid=file=>!!file&&(sizes.length?sizes.includes(file.size):max>0&&file.size>=min&&file.size<=max&&file.size%step===0),bad=()=>sizes.length?t.badInstall:t.badHd.replace("{min}",min.toLocaleString()).replace("{max}",max.toLocaleString());form.dataset.valid="";button.disabled=true;if(!sizes.length)fetch("/info").then(r=>r.json()).then(info=>{max=Number(info.hdMax||0);form.dataset.max=max;form.querySelector("p").textContent=t.hdInfo.replace("{max}",max.toLocaleString());input.dispatchEvent(new Event("change"))});input.addEventListener("change",()=>{const file=input.files[0],ok=valid(file);name.textContent=file?file.name:t.none;form.dataset.valid=ok?"1":"";button.disabled=!ok;setProgress(0,file&&!ok?bad():t.ready)});form.addEventListener("submit",event=>{event.preventDefault();const file=input.files[0];if(!valid(file))return;enableForms(false);setProgress(0,t.prepare);const xhr=new XMLHttpRequest();xhr.open("POST",form.action);xhr.setRequestHeader("Content-Type","application/octet-stream");xhr.upload.onprogress=e=>{if(!e.lengthComputable)return;const p=Math.round(e.loaded*100/e.total);setProgress(p,t.sending.replace("{name}",file.name).replace("{percent}",p))};xhr.upload.onload=()=>setProgress(100,t.verify);xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300)setProgress(100,t.done);else{setProgress(0,t.fail);enableForms(true)}};xhr.onerror=()=>{setProgress(0,t.fail);enableForms(true)};xhr.send(file)})});
 </script></body></html>)HTML";
 
 static uint32_t webCrc32(const uint8_t *data, size_t len, uint32_t crc) {
@@ -117,8 +112,10 @@ static uint32_t installVolumeBytesForUpload(uint32_t bytes) {
 
 static bool uploadSizeIsValid(UploadTarget target, uint32_t bytes) {
     if (target == UploadTarget::HardDisk) {
+        const uint32_t maxBytes = hdRawFlashStorageIsSafe(512U)
+            ? hdRawFlashStorageMaxImageBytes() & ~511U : 0;
         return bytes >= WEB_IMAGE_MIN_BYTES &&
-               bytes <= WEB_IMAGE_MAX_BYTES && (bytes % 512U) == 0;
+               bytes <= maxBytes && (bytes % 512U) == 0;
     }
     return installVolumeBytesForUpload(bytes) != 0;
 }
@@ -136,21 +133,6 @@ static bool dc42HeaderIsValid(uint32_t volumeBytes, uint32_t requestBytes) {
     const uint32_t tagBytes = readBe32(dc42Header + 68);
     return requestBytes == 84U + volumeBytes + tagBytes &&
            (tagBytes == 0 || tagBytes == (volumeBytes / 512U) * 12U);
-}
-
-static uint32_t uploadFlashAddress(UploadTarget target) {
-    return target == UploadTarget::HardDisk
-        ? hdRawFlashStorageAddress() : hdInstallStorageAddress();
-}
-
-static uint32_t uploadEraseBytes(UploadTarget target) {
-    return target == UploadTarget::HardDisk
-        ? hdRawFlashStorageMaxImageBytes() + 4096U : INSTALL_ERASE_BYTES;
-}
-
-static uint32_t uploadMagic(UploadTarget target) {
-    return target == UploadTarget::HardDisk
-        ? WEB_VALID_MAGIC : INSTALL_VALID_MAGIC;
 }
 
 static const char *uploadTargetName(UploadTarget target) {
@@ -180,8 +162,7 @@ static void showUploadProgress(UploadProgressStage stage,
               static_cast<uint64_t>(current) * 100U / total));
     snprintf(status, sizeof(status), "[%s] %s %s",
              stageName, uploadTargetName(uploadTarget),
-             sdMirrorRequired && uploadTarget == UploadTarget::HardDisk
-                 ? "SD" : "FLASH");
+             uploadTarget == UploadTarget::InstallDisk ? "SD" : "FLASH");
     dispShowProgress("WIFI TRANSFER MODE", status,
                      "AP MacPlus-Install / 192.168.4.1", current, total);
 
@@ -224,95 +205,40 @@ static bool writeHardDiskMetadata(uint32_t magic, uint32_t imageBytes,
                            sizeof(metadata)) == ESP_OK;
 }
 
-static bool writeInstallMarker(uint32_t volumeBytes) {
-    uint32_t marker[2] = {INSTALL_VALID_MAGIC, volumeBytes};
-    return spi_flash_write(hdInstallStorageMarkerAddress(), marker,
-                           sizeof(marker)) == ESP_OK;
-}
-
 static bool closeSdFile();
 
-static bool sdHardDiskImageIsValid(uint32_t imageBytes) {
-    FILE *file = fopen("/sd/hd.upload", "rb");
-    if (file == nullptr) return false;
-    uint8_t block[512];
-    bool valid = fread(block, 1, sizeof(block), file) == sizeof(block) &&
-                 block[0] == 0x45 && block[1] == 0x52 &&
-                 fseek(file, 512, SEEK_SET) == 0 &&
-                 fread(block, 1, sizeof(block), file) == sizeof(block) &&
-                 block[0] == 0x50 && block[1] == 0x4D;
-    const uint32_t imageBlocks = imageBytes / 512U;
-    const uint32_t entries = valid ? readBe32(block + 4) : 0;
-    bool foundVolume = false;
-    valid = valid && entries != 0 && entries < imageBlocks;
-    for (uint32_t entry = 1; valid && entry <= entries; ++entry) {
-        if (fseek(file, static_cast<long>(entry) * 512L, SEEK_SET) != 0 ||
-            fread(block, 1, sizeof(block), file) != sizeof(block)) {
-            valid = false;
-            break;
-        }
-        const bool isHfs = memcmp(block + 48, "Apple_HFS", 9) == 0;
-        const bool isMfs = memcmp(block + 48, "Apple_MFS", 9) == 0;
-        if (!isHfs && !isMfs) {
-            continue;
-        }
-        const uint64_t partitionStart = readBe32(block + 8);
-        const uint64_t partitionBlocks = readBe32(block + 12);
-        const uint64_t dataStart = readBe32(block + 80);
-        const uint64_t header = (partitionStart + dataStart) * 512ULL + 1024ULL;
-        if (partitionBlocks < 2U || partitionStart >= imageBlocks ||
-            partitionBlocks > imageBlocks - partitionStart ||
-            dataStart > partitionBlocks - 2U || header + 2U > imageBytes ||
-            fseek(file, static_cast<long>(header), SEEK_SET) != 0 ||
-            fread(block, 1, 2, file) != 2) {
-            valid = false;
-            break;
-        }
-        foundVolume = isHfs
-            ? (block[0] == 0x42 && block[1] == 0x44)
-            : (block[0] == 0xD2 && block[1] == 0xD7);
-        if (!foundVolume) valid = false;
-        break;
-    }
-    fclose(file);
-    return valid && foundVolume;
-}
-
-static bool writeUploadedData(uint32_t address, const uint8_t *data,
-                              size_t bytes) {
-    const esp_err_t error = spi_flash_write(address + uploadOffset, data, bytes);
-    if (error != ESP_OK) {
-        printf("WEB: flash write failed at %lu (%d)\n",
-               static_cast<unsigned long>(uploadOffset),
-               static_cast<int>(error));
-        return false;
-    }
-    if (sdFile != nullptr && uploadTarget == UploadTarget::HardDisk &&
-        fwrite(data, 1, bytes, sdFile) != bytes) {
-        printf("WEB: SD write failed\n");
-        closeSdFile();
-        return false;
-    }
+static bool writeUploadedData(const uint8_t *data, size_t bytes) {
     if (uploadTarget == UploadTarget::HardDisk) {
+        const esp_err_t error = spi_flash_write(
+            hdRawFlashStorageAddress() + uploadOffset, data, bytes);
+        if (error != ESP_OK) {
+            printf("WEB: Flash write failed at %lu (%d)\n",
+                   static_cast<unsigned long>(uploadOffset),
+                   static_cast<int>(error));
+            return false;
+        }
         uploadContentCrc = webCrc32(data, bytes, uploadContentCrc);
+    } else if (sdFile == nullptr || fwrite(data, 1, bytes, sdFile) != bytes) {
+        printf("WEB: install disk SD write failed\n");
+        return false;
     }
     uploadOffset += static_cast<uint32_t>(bytes);
     return true;
 }
 
 static bool uploadedImageSignatureIsValid(UploadTarget target) {
-    uint8_t signature[2] = {};
     if (target == UploadTarget::HardDisk) {
-        const bool flashValid = hdRawFlashImageIsValid(uploadExpectedBytes);
-        return flashValid &&
-               (!sdMirrorRequired || sdHardDiskImageIsValid(uploadExpectedBytes));
+        return hdRawFlashImageIsValid(uploadExpectedBytes);
     }
-    if (spi_flash_read(hdInstallStorageAddress() + 1024U, signature,
-                       sizeof(signature)) != ESP_OK) {
-        return false;
-    }
-    return (signature[0] == 0x42 && signature[1] == 0x44) ||
-           (signature[0] == 0xD2 && signature[1] == 0xD7);
+    uint8_t signature[2] = {};
+    FILE *file = fopen(INSTALL_TEMP_PATH, "rb");
+    const bool valid = file != nullptr &&
+        fseek(file, 1024L, SEEK_SET) == 0 &&
+        fread(signature, 1, sizeof(signature), file) == sizeof(signature) &&
+        ((signature[0] == 0x42 && signature[1] == 0x44) ||
+         (signature[0] == 0xD2 && signature[1] == 0xD7));
+    if (file != nullptr) fclose(file);
+    return valid;
 }
 
 static bool closeSdFile() {
@@ -325,25 +251,36 @@ static bool closeSdFile() {
     return ok;
 }
 
-static bool commitSdMirror() {
-    static constexpr const char *HD_PATH = "/sd/hd.img";
-    static constexpr const char *TEMP_PATH = "/sd/hd.upload";
-    static constexpr const char *BACKUP_PATH = "/sd/hd.backup";
-
-    remove(BACKUP_PATH);
+static bool commitInstallDisk() {
+    struct stat originalInfo = {};
+    struct stat backupInfo = {};
+    if (stat(INSTALL_PATH, &originalInfo) != 0 &&
+        stat(INSTALL_BACKUP_PATH, &backupInfo) == 0) {
+        if (rename(INSTALL_BACKUP_PATH, INSTALL_PATH) != 0) return false;
+    }
+    remove(INSTALL_BACKUP_PATH);
     errno = 0;
-    const bool hadOriginal = rename(HD_PATH, BACKUP_PATH) == 0;
+    const bool hadOriginal = rename(INSTALL_PATH, INSTALL_BACKUP_PATH) == 0;
     if (!hadOriginal && errno != ENOENT) return false;
-    if (rename(TEMP_PATH, HD_PATH) != 0) {
-        if (hadOriginal) rename(BACKUP_PATH, HD_PATH);
+    if (rename(INSTALL_TEMP_PATH, INSTALL_PATH) != 0) {
+        if (hadOriginal) rename(INSTALL_BACKUP_PATH, INSTALL_PATH);
         return false;
     }
-    if (hadOriginal) remove(BACKUP_PATH);
+    if (hadOriginal) remove(INSTALL_BACKUP_PATH);
     return true;
 }
 
 static void handleRoot() {
     webServer->send_P(200, "text/html; charset=utf-8", INSTALL_PAGE);
+}
+
+static void handleInfo() {
+    const uint32_t maxBytes = hdRawFlashStorageIsSafe(512U)
+        ? hdRawFlashStorageMaxImageBytes() & ~511U : 0;
+    char response[48];
+    snprintf(response, sizeof(response), "{\"hdMax\":%lu}",
+             static_cast<unsigned long>(maxBytes));
+    webServer->send(200, "application/json", response);
 }
 
 static void handleUploadFinish(UploadTarget target) {
@@ -376,7 +313,6 @@ static void handleRawUpload(UploadTarget target) {
         uploadRequestBytes = 0;
         uploadInputOffset = 0;
         uploadIsDc42 = false;
-        sdMirrorRequired = false;
 
         const long requestLength = webServer->header("Content-Length").toInt();
         const uint32_t requestBytes = requestLength > 0 &&
@@ -402,47 +338,56 @@ static void handleRawUpload(UploadTarget target) {
                        requestBytes != uploadExpectedBytes;
         lastConsoleStage = UploadProgressStage::Invalid;
         lastConsoleBucket = -1;
-        if (uploadTarget == UploadTarget::HardDisk) {
+        if (uploadTarget == UploadTarget::InstallDisk) {
             if (!sdcardMounted()) sdcardInit();
             if (sdcardMounted()) {
-                remove("/sd/hd.upload");
-                sdFile = fopen("/sd/hd.upload", "wb");
-                if (sdFile == nullptr) {
-                    printf("WEB: cannot create optional SD mirror\n");
-                } else {
-                    sdMirrorRequired = true;
-                }
+                remove(INSTALL_TEMP_PATH);
+                sdFile = fopen(INSTALL_TEMP_PATH, "wb");
             }
-        }
-        const uint32_t requiredHdBytes =
-            (uploadExpectedBytes + 4095U) & ~4095U;
-        const bool storageSafe = target == UploadTarget::HardDisk
-            ? hdRawFlashStorageIsSafe(requiredHdBytes)
-            : hdInstallStorageIsSafe();
-        if (!uploadError && !storageSafe) {
-            printf("WEB: target flash range is unavailable\n");
+            if (sdFile == nullptr) {
+                printf("WEB: cannot create %s\n", INSTALL_TEMP_PATH);
+                uploadError = true;
+                uploadFinished = true;
+                showTransferStatus("[FAIL] SD CARD REQUIRED");
+                return;
+            }
+        } else if (!hdRawFlashStorageIsSafe(uploadExpectedBytes)) {
+            printf("WEB: '%s' partition is missing or too small\n",
+                   MACPLUS_DATA_PARTITION_LABEL);
             uploadError = true;
             uploadFinished = true;
             showTransferStatus("[FAIL] DATA PARTITION REQUIRED");
             return;
         }
-        const uint32_t eraseBytes = uploadEraseBytes(target);
-        showUploadProgress(UploadProgressStage::Erase, 0, eraseBytes);
-        for (uint32_t erased = 0; !uploadError && erased < eraseBytes;
-             erased += 0x10000U) {
-            const uint32_t left = eraseBytes - erased;
-            const uint32_t chunk = left < 0x10000U ? left : 0x10000U;
-            const esp_err_t err = spi_flash_erase_range(
-                uploadFlashAddress(target) + erased, chunk);
-            if (err != ESP_OK) {
-                printf("WEB: flash erase failed (%d)\n", static_cast<int>(err));
+
+        if (target == UploadTarget::HardDisk) {
+            const uint32_t imageEraseBytes =
+                (uploadExpectedBytes + 4095U) & ~4095U;
+            const uint32_t totalEraseBytes =
+                MACPLUS_HD_METADATA_BYTES + imageEraseBytes;
+            showUploadProgress(UploadProgressStage::Erase, 0, totalEraseBytes);
+            if (spi_flash_erase_range(hdRawFlashStorageMetadataAddress(),
+                                      MACPLUS_HD_METADATA_BYTES) != ESP_OK) {
                 uploadError = true;
             }
-            if (!uploadError) {
-                showUploadProgress(UploadProgressStage::Erase,
-                                   erased + chunk, eraseBytes);
+            for (uint32_t erased = 0; !uploadError && erased < imageEraseBytes;
+                 erased += 0x10000U) {
+                const uint32_t left = imageEraseBytes - erased;
+                const uint32_t chunk = left < 0x10000U ? left : 0x10000U;
+                const esp_err_t err = spi_flash_erase_range(
+                    hdRawFlashStorageAddress() + erased, chunk);
+                if (err != ESP_OK) {
+                    printf("WEB: Flash erase failed (%d)\n",
+                           static_cast<int>(err));
+                    uploadError = true;
+                }
+                if (!uploadError) {
+                    showUploadProgress(UploadProgressStage::Erase,
+                        MACPLUS_HD_METADATA_BYTES + erased + chunk,
+                        totalEraseBytes);
+                }
+                delay(1);
             }
-            delay(1);
         }
         if (uploadError) {
             showTransferStatus("[FAIL] ERASE ERROR");
@@ -453,7 +398,6 @@ static void handleRawUpload(UploadTarget target) {
         lastDisplayUpdateMs = millis();
     } else if (upload.status == RAW_WRITE) {
         const uint32_t maxBytes = uploadExpectedBytes;
-        const uint32_t addr = uploadFlashAddress(uploadTarget);
         if (!uploadError && uploadTarget == target &&
             upload.currentSize <= uploadRequestBytes - uploadInputOffset) {
             const uint8_t *source = upload.buf;
@@ -477,12 +421,12 @@ static void handleRawUpload(UploadTarget target) {
                 const size_t dataBytes = min<size_t>(
                     remaining, sizeof(dc42Header) + maxBytes - inputPosition);
                 if (inputPosition - sizeof(dc42Header) != uploadOffset ||
-                    !writeUploadedData(addr, source, dataBytes)) {
+                    !writeUploadedData(source, dataBytes)) {
                     uploadError = true;
                 }
             } else if (!uploadError && !uploadIsDc42 &&
                        (remaining > maxBytes - uploadOffset ||
-                        !writeUploadedData(addr, source, remaining))) {
+                        !writeUploadedData(source, remaining))) {
                 uploadError = true;
             }
             uploadInputOffset += upload.currentSize;
@@ -497,7 +441,6 @@ static void handleRawUpload(UploadTarget target) {
         }
     } else if (upload.status == RAW_END) {
         const uint32_t maxBytes = uploadExpectedBytes;
-        uint32_t magic = uploadMagic(uploadTarget);
         if (!closeSdFile()) uploadError = true;
         const bool complete = !uploadError && uploadTarget == target &&
                               uploadInputOffset == uploadRequestBytes &&
@@ -507,30 +450,27 @@ static void handleRawUpload(UploadTarget target) {
                    uploadTargetName(target));
             uploadError = true;
         }
-        if (complete && target == UploadTarget::HardDisk &&
-            !uploadError && sdMirrorRequired && !commitSdMirror()) {
-            printf("WEB: cannot commit SD staging file\n");
+        if (complete && target == UploadTarget::InstallDisk &&
+            !uploadError && !commitInstallDisk()) {
+            printf("WEB: cannot commit install disk staging file\n");
             uploadError = true;
         }
-        if (target == UploadTarget::HardDisk) magic = WEB_PINNED_MAGIC;
         if (!uploadError && complete) {
             uint32_t footerCrc = 0;
-            if (!uploadError) {
-                if (target == UploadTarget::HardDisk) {
-                    if (!hardDiskFingerprint(maxBytes, &footerCrc) ||
-                        !writeHardDiskMetadata(magic, maxBytes, footerCrc,
-                                               uploadContentCrc)) {
-                        uploadError = true;
-                    }
-                } else if (target == UploadTarget::InstallDisk) {
-                    uploadError = !writeInstallMarker(maxBytes);
+            if (target == UploadTarget::HardDisk) {
+                if (!hardDiskFingerprint(maxBytes, &footerCrc) ||
+                    !writeHardDiskMetadata(WEB_PINNED_MAGIC, maxBytes,
+                                           footerCrc, uploadContentCrc)) {
+                    uploadError = true;
                 }
             }
         } else {
             uploadError = true;
         }
         closeSdFile();
-        if (uploadError) remove("/sd/hd.upload");
+        if (uploadError && target == UploadTarget::InstallDisk) {
+            remove(INSTALL_TEMP_PATH);
+        }
         uploadFinished = true;
         if (!uploadError) {
             showUploadProgress(UploadProgressStage::Write,
@@ -543,7 +483,7 @@ static void handleRawUpload(UploadTarget target) {
                                        : "[OK] VERIFY COMPLETE");
     } else if (upload.status == RAW_ABORTED) {
         closeSdFile();
-        remove("/sd/hd.upload");
+        if (target == UploadTarget::InstallDisk) remove(INSTALL_TEMP_PATH);
         uploadError = true;
         uploadFinished = false;
         printf("WEB: upload aborted at %lu bytes\n",
@@ -594,6 +534,7 @@ void webInstallRun() {
         const char *requestHeaders[] = {"Content-Length", "Content-Type"};
         webServer->collectHeaders(requestHeaders, 2);
         webServer->on("/", handleRoot);
+        webServer->on("/info", handleInfo);
         webServer->on("/upload/hd", HTTP_POST, handleHdUploadFinish,
                       handleHdUpload);
         webServer->on("/upload/install", HTTP_POST, handleInstallUploadFinish,

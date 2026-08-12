@@ -11,6 +11,7 @@ void cardputerInputImuStatus();
 void cardputerInputMouseStatus();
 void cardputerInputKeysStatus();
 bool cardputerInputAnyKeyPressed();
+uint8_t cardputerInputReadKeyPress();
 
 // IMU tuning (radial joystick tilt control). The accelerometer measures the
 // gravity tilt vector. Motion engages above 5 degrees and releases below

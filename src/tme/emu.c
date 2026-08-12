@@ -440,9 +440,8 @@ void tmeStartEmu(void *rom) {
 	SCSIDevice *hd=hdCreate();
 	ncrRegisterDevice(6, hd);
 	iwmInit();
-	const uint8_t *installDisk = hdGetInstallVolumeData();
 	const uint32_t installDiskBytes = hdGetInstallVolumeBytes();
-	if (installDisk != NULL) {
+	if (installDiskBytes != 0) {
 		// Keep the uploaded disk out of the boot drive scan.  System 3 polls
 		// the Sony drive after Finder is up and will then mount the change.
 		installInsertFrames = 600; // ten seconds at 60 Hz
@@ -515,7 +514,7 @@ void tmeStartEmu(void *rom) {
 		}
 		frame++;
 		if (installInsertFrames > 0 && --installInsertFrames == 0) {
-			iwmSetDisk(installDisk, installDiskBytes, 1);
+			iwmSetDiskReader(hdReadInstallSector, installDiskBytes, 1);
 			printf("INSTALL: IWM disk inserted (%luKB %s)\n",
 			       (unsigned long)(installDiskBytes / 1024U),
 			       hdIsInstallVolumeMfs() ? "MFS" : "HFS");

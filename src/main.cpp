@@ -21,6 +21,7 @@
 
 #include "hardware_config.h"
 #include "input.h"
+#include "partition_setup.h"
 #include "sdcard.h"
 #include "webinstall.h"
 
@@ -367,6 +368,8 @@ void setup() {
         sdReady = sdcardRetry();
     }
     sdcardPrintRoot();
+
+    if (sdReady) macplusStorageSetup();
 
     loadPram();
     rtcInit(pram);

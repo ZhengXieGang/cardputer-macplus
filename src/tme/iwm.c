@@ -1,8 +1,7 @@
 /*
  * Minimal Macintosh Plus IWM state used by the system ROM.
  *
- * Uploaded MFS/HFS volumes are kept in a memory-mapped Flash slot and can be
- * inserted here after the system disk has finished booting.
+ * Uploaded MFS/HFS volumes are read one sector at a time from SD.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -68,9 +67,12 @@ static const uint8_t kBitSlip[2] = {0xDE, 0xAA};
 static int iwmLines;
 static int iwmModeReg;
 static int iwmHeadSel;
-static const uint8_t *floppyData;
+static IwmSectorReader floppyReader;
 static uint32_t floppyBytes;
 static uint32_t floppyReadBytes;
+static uint32_t cachedSourceSector;
+static uint8_t sourceSector[512];
+static uint8_t sourceSectorValid;
 static uint32_t trackPosition;
 static uint32_t cycleAccumulator;
 static uint8_t readBitCount;
@@ -118,7 +120,18 @@ static uint32_t sectorOffset(uint8_t track, uint8_t side, uint8_t sector) {
 static uint8_t sourceByte(uint8_t track, uint8_t side, uint8_t sector,
                           uint16_t index) {
     if (index < 12U) return 0;
-    return floppyData[sectorOffset(track, side, sector) * 512U + index - 12U];
+    const uint32_t source = sectorOffset(track, side, sector);
+    if (!sourceSectorValid || cachedSourceSector != source) {
+        if (floppyReader == NULL || !floppyReader(source, sourceSector)) {
+            sourceSectorValid = 0;
+            diskInserted = 0;
+            motorOn = 0;
+            return 0;
+        }
+        cachedSourceSector = source;
+        sourceSectorValid = 1;
+    }
+    return sourceSector[index - 12U];
 }
 
 static void encodeSector(uint8_t track, uint8_t side, uint8_t sector) {
@@ -350,9 +363,11 @@ void iwmInit(void) {
     iwmLines = 0;
     iwmModeReg = 0;
     iwmHeadSel = 0;
-    floppyData = NULL;
+    floppyReader = NULL;
     floppyBytes = 0;
     floppyReadBytes = 0;
+    cachedSourceSector = 0;
+    sourceSectorValid = 0;
     trackPosition = 0;
     cycleAccumulator = 0;
     readBitCount = 0;
@@ -367,16 +382,17 @@ void iwmInit(void) {
 
 }
 
-void iwmSetDisk(const uint8_t *data, uint32_t bytes, int inserted) {
-    if (data == NULL || (bytes != 400U * 1024U && bytes != 800U * 1024U)) {
-        floppyData = NULL;
+void iwmSetDiskReader(IwmSectorReader reader, uint32_t bytes, int inserted) {
+    if (reader == NULL || (bytes != 400U * 1024U && bytes != 800U * 1024U)) {
+        floppyReader = NULL;
         floppyBytes = 0;
         diskInserted = 0;
         motorOn = 0;
         diskSwitched = 0;
+        sourceSectorValid = 0;
         return;
     }
-    floppyData = data;
+    floppyReader = reader;
     floppyBytes = bytes;
     diskInserted = inserted ? 1U : 0U;
     motorOn = 0;
@@ -388,6 +404,7 @@ void iwmSetDisk(const uint8_t *data, uint32_t bytes, int inserted) {
     dataReg = 0;
     shiftReg = 0;
     encodedValid = 0;
+    sourceSectorValid = 0;
 }
 
 void iwmAccess(unsigned int addr) {
@@ -433,7 +450,7 @@ unsigned int iwmRead(unsigned int addr) {
 
 void iwmTick(unsigned int cycles) {
     if (!internalDriveSelected() || !diskInserted || !motorOn ||
-        floppyData == NULL) return;
+        floppyReader == NULL) return;
     // 500kbit/s at the Macintosh Plus 7.8336MHz CPU clock (500000/7833600 = 625/9792).
     cycleAccumulator += cycles * 625U;
     const uint8_t zone = zoneForTrack(driveTrack);

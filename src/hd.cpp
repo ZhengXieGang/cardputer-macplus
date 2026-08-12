@@ -1,7 +1,4 @@
-/*
- * SCSI HD emulation — SD card file (/sd/hd.img) or flash partition fallback.
- * SD card gives true read/write; flash partition requires erase-before-write.
- */
+/* SCSI hard disk backed by the named `macplus` data partition. */
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -13,7 +10,6 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_partition.h"
-#include "esp_spi_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -26,34 +22,19 @@ extern "C" {
 #include "tme/hd.h"
 }
 
-// Match the SDSPI transfer and SCSI DMA windows. Runtime HD reads use this
-// when the full flash cache is unavailable under a Launcher partition table.
-static constexpr size_t HD_SD_IO_CHUNK_BYTES = 8 * 1024;
 // One flash-sector-sized cache block is both the runtime write-back buffer
 // and the one-time SD-to-flash copy buffer.  This keeps the no-PSRAM SRAM
 // budget flat while allowing raw flash writes after startup.
+static constexpr size_t HD_SD_IO_CHUNK_BYTES = 8 * 1024;
 static constexpr size_t HD_CACHE_BLOCK_BYTES = 4096;
 static constexpr size_t HD_CACHE_BLOCK_COUNT = 1;
 // Keep the power-loss window short.  Reads still come from the mapped Flash
 // image; this only affects the low-priority write-back task.
 static constexpr uint32_t HD_FLUSH_INTERVAL_MS = 250;
 
-// Raw flash cache for the SCSI disk image.  The first boot with the SD card
-// copies /sd/hd.img here; afterwards all reads come from this memory-mapped
-// copy (instant), so loading applications no longer waits on slow random SD
-// reads. The cache starts after the Launcher-managed Mac app slot.
-// This is only a cache. hdRawFlashRangeIsSafe() must approve the complete
-// range against the active Launcher partition table before it is used.
-// Legacy raw storage is retained only for Launcher layouts that do not
-// declare the protected macplus data partition.
-static constexpr uint32_t HD_RAW_FLASH_ADDR = 0x600000;
-static constexpr uint32_t HD_RAW_FLASH_OLD_IMAGE_BYTES = 0x10C000;
-static constexpr uint32_t HD_RAW_FLASH_MAX_IMAGE_BYTES = 0x11F000;
-static constexpr uint32_t HD_RAW_FLASH_METADATA_ADDR = 0x71F000;
 static constexpr uint32_t HD_RAW_FLASH_VALID_MAGIC = 0x4D414344; // "MACD"
 static constexpr uint32_t HD_RAW_FLASH_PINNED_MAGIC = 0x4D414357; // "MACW"
-static constexpr uint32_t HD_RAW_FLASH_METADATA_BYTES =
-    MACPLUS_HD_METADATA_BYTES;
+static constexpr uint32_t HD_RAW_FLASH_METADATA_BYTES = MACPLUS_HD_METADATA_BYTES;
 // The metadata sector also contains a tiny write-ahead journal.  A pending
 // record means the last 4 KiB write may have been interrupted; boot must then
 // rebuild the cache from /sd/hd.img instead of trusting a torn block.
@@ -64,26 +45,22 @@ static constexpr uint32_t HD_RAW_FLASH_JOURNAL_SLOTS =
     HD_RAW_FLASH_JOURNAL_RECORD_BYTES;
 static constexpr uint32_t HD_RAW_FLASH_JOURNAL_PENDING = 0xF0F0F0F0U;
 static constexpr uint32_t HD_RAW_FLASH_JOURNAL_COMMITTED = 0xF0F00000U;
-static constexpr uint32_t INSTALL_FLASH_ADDR = 0x720000U;
 static constexpr uint32_t INSTALL_400K_BYTES =
     MACPLUS_INSTALL_400K_BYTES;
 static constexpr uint32_t INSTALL_800K_BYTES =
     MACPLUS_INSTALL_800K_BYTES;
-static constexpr uint32_t INSTALL_ERASE_BYTES = INSTALL_800K_BYTES + 4096U;
-static constexpr uint32_t INSTALL_VALID_MAGIC = 0x4E545349U; // "INST"
+static constexpr const char *INSTALL_IMAGE_PATH = "/sd/macplus-install.img";
+static constexpr const char *INSTALL_BACKUP_PATH =
+    "/sd/macplus-install.backup";
 static const void *hdFlashMap = nullptr;
 static spi_flash_mmap_handle_t hdFlashMapHandle = 0;
 static const esp_partition_t *hdCachePartition = nullptr;
-static uint32_t hdCacheBase = HD_RAW_FLASH_ADDR;
-static uint32_t hdCacheMetadata = HD_RAW_FLASH_METADATA_ADDR;
-static uint32_t hdCacheImageMax = HD_RAW_FLASH_MAX_IMAGE_BYTES;
-static uint32_t hdInstallBase = INSTALL_FLASH_ADDR;
-static uint32_t hdInstallOffset = INSTALL_FLASH_ADDR - HD_RAW_FLASH_ADDR;
-static bool hdCacheUsesPartition = false;
+static uint32_t hdCacheBase = 0;
+static uint32_t hdCacheMetadata = 0;
+static uint32_t hdCacheImageMax = 0;
 
 struct InstallVolume {
-    const uint8_t *data;
-    spi_flash_mmap_handle_t mapHandle;
+    FILE *file;
     uint32_t bytes;
     bool isMfs;
 };
@@ -113,47 +90,36 @@ static uint32_t rawFlashJournalCrc(uint32_t sequence,
                    sizeof(values), 0);
 }
 
+static void showHdStorageError(const char *error, const char *action) {
+    const char *lines[] = {
+        "MACPLUS STORAGE",
+        error,
+        action,
+    };
+    dispShowMessage(lines, 3);
+    delay(3000);
+}
+
 static bool selectHdCacheStorage(uint32_t requiredBytes) {
     hdCachePartition = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY,
         MACPLUS_DATA_PARTITION_LABEL);
-    const uint32_t partitionHdMax = hdCachePartition != nullptr
-        ? macplusHdMaxForPartition(hdCachePartition->size) : 0;
-    const uint32_t partitionRequired = partitionHdMax ==
-                                                MACPLUS_HD_FULL_MAX_IMAGE_BYTES
-                                            ? MACPLUS_DATA_PARTITION_FULL_BYTES
-                                            : MACPLUS_DATA_PARTITION_STANDARD_BYTES;
-    if (hdCachePartition != nullptr && partitionHdMax != 0 &&
-        hdCachePartition->size >= partitionRequired &&
-        (requiredBytes == 0 || requiredBytes <= partitionHdMax + 4096U)) {
-        hdCacheBase = hdCachePartition->address;
-        hdCacheImageMax = partitionHdMax;
-        hdCacheMetadata = hdCacheBase + hdCacheImageMax;
-        hdInstallOffset = hdCacheImageMax + MACPLUS_INSTALL_GAP_BYTES;
-        hdInstallBase = hdCacheBase + hdInstallOffset;
-        hdCacheUsesPartition = true;
-        return true;
+    if (hdCachePartition == nullptr ||
+        hdCachePartition->size <= MACPLUS_HD_DATA_OFFSET) {
+        hdCacheBase = 0;
+        hdCacheMetadata = 0;
+        hdCacheImageMax = 0;
+        return false;
     }
-    hdCachePartition = nullptr;
-    hdCacheBase = HD_RAW_FLASH_ADDR;
-    hdCacheImageMax = HD_RAW_FLASH_MAX_IMAGE_BYTES;
-    hdCacheMetadata = HD_RAW_FLASH_METADATA_ADDR;
-    hdInstallBase = INSTALL_FLASH_ADDR;
-    hdInstallOffset = INSTALL_FLASH_ADDR - HD_RAW_FLASH_ADDR;
-    hdCacheUsesPartition = false;
-    return (requiredBytes == 0 ||
-            requiredBytes <= HD_RAW_FLASH_MAX_IMAGE_BYTES + 4096U) &&
-           hdRawFlashRangeIsSafe(HD_RAW_FLASH_ADDR,
-                                 HD_RAW_FLASH_MAX_IMAGE_BYTES + 4096U) &&
-           hdRawFlashRangeIsSafe(INSTALL_FLASH_ADDR, INSTALL_ERASE_BYTES);
+    hdCacheMetadata = hdCachePartition->address;
+    hdCacheBase = hdCachePartition->address + MACPLUS_HD_DATA_OFFSET;
+    hdCacheImageMax = hdCachePartition->size - MACPLUS_HD_DATA_OFFSET;
+    return requiredBytes == 0 || requiredBytes <= hdCacheImageMax;
 }
 
 bool hdRawFlashStorageIsSafe(uint32_t bytes) {
-    return bytes != 0 && (bytes & 4095U) == 0 &&
-           selectHdCacheStorage(bytes);
+    return bytes != 0 && selectHdCacheStorage(bytes);
 }
-
-bool hdInstallStorageIsSafe(void) { return selectHdCacheStorage(0); }
 
 uint32_t hdRawFlashStorageAddress(void) { return hdCacheBase; }
 
@@ -161,43 +127,49 @@ uint32_t hdRawFlashStorageMetadataAddress(void) { return hdCacheMetadata; }
 
 uint32_t hdRawFlashStorageMaxImageBytes(void) { return hdCacheImageMax; }
 
-uint32_t hdInstallStorageAddress(void) { return hdInstallBase; }
-
-uint32_t hdInstallStorageMarkerAddress(void) {
-    return hdInstallBase + INSTALL_800K_BYTES;
-}
-
 bool hdRawFlashStorageRead(uint32_t offset, uint8_t *buffer, size_t bytes) {
-    if (buffer == nullptr || offset > hdCacheImageMax + 4096U ||
-        bytes > hdCacheImageMax + 4096U - offset) {
+    if (hdCachePartition == nullptr && !selectHdCacheStorage(0)) return false;
+    if (buffer == nullptr || offset > hdCacheImageMax ||
+        bytes > hdCacheImageMax - offset) {
         return false;
     }
-    if (!hdCacheUsesPartition &&
-        (hdCacheBase >= spi_flash_get_chip_size() ||
-         bytes > spi_flash_get_chip_size() - hdCacheBase - offset)) {
-        return false;
-    }
-    if (hdCacheUsesPartition) {
-        return esp_partition_read(hdCachePartition, offset, buffer, bytes) ==
-               ESP_OK;
-    }
-    return spi_flash_read(hdCacheBase + offset, buffer, bytes) == ESP_OK;
+    return esp_partition_read(hdCachePartition,
+                              MACPLUS_HD_DATA_OFFSET + offset,
+                              buffer, bytes) == ESP_OK;
 }
 
 static bool writeHdCache(uint32_t offset, const uint8_t *data, size_t bytes) {
-    if (hdCacheUsesPartition) {
-        return esp_partition_write(hdCachePartition, offset, data, bytes) ==
-               ESP_OK;
-    }
-    return spi_flash_write(hdCacheBase + offset, data, bytes) == ESP_OK;
+    return hdCachePartition != nullptr &&
+           esp_partition_write(hdCachePartition,
+                               MACPLUS_HD_DATA_OFFSET + offset,
+                               data, bytes) == ESP_OK;
 }
 
 static bool eraseHdCache(uint32_t offset, size_t bytes) {
-    if (hdCacheUsesPartition) {
-        return esp_partition_erase_range(hdCachePartition, offset, bytes) ==
-               ESP_OK;
-    }
-    return spi_flash_erase_range(hdCacheBase + offset, bytes) == ESP_OK;
+    return hdCachePartition != nullptr &&
+           esp_partition_erase_range(hdCachePartition,
+                                     MACPLUS_HD_DATA_OFFSET + offset,
+                                     bytes) == ESP_OK;
+}
+
+static bool readHdMetadata(uint32_t offset, void *data, size_t bytes) {
+    return hdCachePartition != nullptr &&
+           offset <= MACPLUS_HD_METADATA_BYTES &&
+           bytes <= MACPLUS_HD_METADATA_BYTES - offset &&
+           esp_partition_read(hdCachePartition, offset, data, bytes) == ESP_OK;
+}
+
+static bool writeHdMetadata(uint32_t offset, const void *data, size_t bytes) {
+    return hdCachePartition != nullptr &&
+           offset <= MACPLUS_HD_METADATA_BYTES &&
+           bytes <= MACPLUS_HD_METADATA_BYTES - offset &&
+           esp_partition_write(hdCachePartition, offset, data, bytes) == ESP_OK;
+}
+
+static bool eraseHdMetadata(void) {
+    return hdCachePartition != nullptr &&
+           esp_partition_erase_range(hdCachePartition, 0,
+                                     MACPLUS_HD_METADATA_BYTES) == ESP_OK;
 }
 
 static bool rawImageBytesIsValid(uint32_t imageBytes) {
@@ -233,27 +205,8 @@ static bool rawFlashFingerprint(uint32_t imageBytes, uint32_t *fingerprint) {
     return true;
 }
 
-// The short fingerprint cheaply detects changed sources. This CRC protects
-// against damage anywhere in the cached image before it is reused at boot.
-static bool rawFlashContentCrc(uint32_t imageBytes, uint32_t *contentCrc) {
-    if (contentCrc == nullptr || !rawImageBytesIsValid(imageBytes)) return false;
-    uint8_t sector[512];
-    uint32_t crc = 0;
-    for (uint32_t offset = 0; offset < imageBytes; offset += sizeof(sector)) {
-        if (!hdRawFlashStorageRead(offset, sector, sizeof(sector))) {
-            return false;
-        }
-        crc = hdCrc32(sector, sizeof(sector), crc);
-    }
-    *contentCrc = crc;
-    return true;
-}
-
 static bool readRawFlashMetadata(RawFlashMetadata *metadata) {
-    if (metadata == nullptr ||
-        !hdRawFlashStorageRead(hdCacheImageMax,
-                               reinterpret_cast<uint8_t *>(metadata),
-                               sizeof(*metadata))) {
+    if (metadata == nullptr || !readHdMetadata(0, metadata, sizeof(*metadata))) {
         return false;
     }
     return (metadata->magic == HD_RAW_FLASH_VALID_MAGIC ||
@@ -269,11 +222,7 @@ static bool writeRawFlashMetadata(uint32_t magic, uint32_t imageBytes,
         return false;
     }
     RawFlashMetadata metadata = {magic, imageBytes, fingerprint, contentCrc};
-    return eraseHdCache(hdCacheImageMax,
-                        HD_RAW_FLASH_METADATA_BYTES) &&
-           writeHdCache(hdCacheImageMax,
-                        reinterpret_cast<const uint8_t *>(&metadata),
-                        sizeof(metadata));
+    return eraseHdMetadata() && writeHdMetadata(0, &metadata, sizeof(metadata));
 }
 
 static bool rawFlashJournalRecordIsErased(
@@ -301,11 +250,9 @@ static bool rawFlashJournalHasPending(void) {
     int lastDamagedSlot = -1;
     for (uint32_t slot = 0; slot < HD_RAW_FLASH_JOURNAL_SLOTS; ++slot) {
         RawFlashJournalRecord record = {};
-        const uint32_t offset = hdCacheImageMax +
-                                HD_RAW_FLASH_JOURNAL_OFFSET +
+        const uint32_t offset = HD_RAW_FLASH_JOURNAL_OFFSET +
                                 slot * HD_RAW_FLASH_JOURNAL_RECORD_BYTES;
-        if (!hdRawFlashStorageRead(offset, reinterpret_cast<uint8_t *>(&record),
-                                   sizeof(record))) {
+        if (!readHdMetadata(offset, &record, sizeof(record))) {
             return true;
         }
         if (rawFlashJournalRecordIsErased(record)) continue;
@@ -321,8 +268,9 @@ static bool rawFlashJournalHasPending(void) {
             newestState = record.state;
         }
     }
-    return (lastDamagedSlot == lastNonErasedSlot) || (haveNewest &&
-                       newestState != HD_RAW_FLASH_JOURNAL_COMMITTED);
+    if (lastNonErasedSlot < 0) return false;
+    return (lastDamagedSlot == lastNonErasedSlot) ||
+           (haveNewest && newestState != HD_RAW_FLASH_JOURNAL_COMMITTED);
 }
 
 static bool rawFlashJournalAppend(uint32_t blockIndex, uint32_t state) {
@@ -336,11 +284,9 @@ static bool rawFlashJournalAppend(uint32_t blockIndex, uint32_t state) {
     bool haveSequence = false;
     for (uint32_t slot = 0; slot < HD_RAW_FLASH_JOURNAL_SLOTS; ++slot) {
         RawFlashJournalRecord record = {};
-        const uint32_t offset = hdCacheImageMax +
-                                HD_RAW_FLASH_JOURNAL_OFFSET +
+        const uint32_t offset = HD_RAW_FLASH_JOURNAL_OFFSET +
                                 slot * HD_RAW_FLASH_JOURNAL_RECORD_BYTES;
-        if (!hdRawFlashStorageRead(offset, reinterpret_cast<uint8_t *>(&record),
-                                   sizeof(record))) {
+        if (!readHdMetadata(offset, &record, sizeof(record))) {
             return false;
         }
         if (rawFlashJournalRecordIsErased(record)) {
@@ -360,10 +306,8 @@ static bool rawFlashJournalAppend(uint32_t blockIndex, uint32_t state) {
         // start the new transaction in the freshly erased sector.
         RawFlashMetadata metadata = {};
         if (!readRawFlashMetadata(&metadata) ||
-            !eraseHdCache(hdCacheImageMax, HD_RAW_FLASH_METADATA_BYTES) ||
-            !writeHdCache(hdCacheImageMax,
-                          reinterpret_cast<const uint8_t *>(&metadata),
-                          sizeof(metadata))) {
+            !eraseHdMetadata() || !writeHdMetadata(0, &metadata,
+                                                   sizeof(metadata))) {
             return false;
         }
         freeSlot = 0;
@@ -377,128 +321,73 @@ static bool rawFlashJournalAppend(uint32_t blockIndex, uint32_t state) {
         state,
     };
     record.recordCrc = rawFlashJournalCrc(record.sequence, record.blockIndex);
-    const uint32_t offset = hdCacheImageMax + HD_RAW_FLASH_JOURNAL_OFFSET +
+    const uint32_t offset = HD_RAW_FLASH_JOURNAL_OFFSET +
                             static_cast<uint32_t>(freeSlot) *
                                 HD_RAW_FLASH_JOURNAL_RECORD_BYTES;
-    return writeHdCache(offset, reinterpret_cast<const uint8_t *>(&record),
-                        sizeof(record));
-}
-
-static bool readOldRawFlashFooter(uint32_t *magic, uint32_t *fingerprint) {
-    // The old footer lived in the legacy raw hole.  The same relative offset
-    // is ordinary disk data inside the named partition and must never be
-    // interpreted or erased as metadata.
-    if (hdCacheUsesPartition) return false;
-    uint32_t storedMagic = 0;
-    uint32_t storedFingerprint = 0;
-    if (!hdRawFlashStorageRead(HD_RAW_FLASH_OLD_IMAGE_BYTES,
-                               reinterpret_cast<uint8_t *>(&storedMagic),
-                               sizeof(storedMagic)) ||
-        !hdRawFlashStorageRead(HD_RAW_FLASH_OLD_IMAGE_BYTES + sizeof(storedMagic),
-                               reinterpret_cast<uint8_t *>(&storedFingerprint),
-                               sizeof(storedFingerprint)) ||
-        (storedMagic != HD_RAW_FLASH_VALID_MAGIC &&
-         storedMagic != HD_RAW_FLASH_PINNED_MAGIC)) {
-        return false;
-    }
-    uint32_t calculated = 0;
-    if (!rawFlashFingerprint(HD_RAW_FLASH_OLD_IMAGE_BYTES, &calculated) ||
-        calculated != storedFingerprint) {
-        return false;
-    }
-    if (magic != nullptr) *magic = storedMagic;
-    if (fingerprint != nullptr) *fingerprint = storedFingerprint;
-    return true;
-}
-
-bool hdRawFlashRangeIsSafe(uint32_t address, uint32_t bytes) {
-    const uint32_t flashBytes = spi_flash_get_chip_size();
-    if (bytes == 0 || (address & 4095U) != 0 || (bytes & 4095U) != 0 ||
-        address >= flashBytes || bytes > flashBytes - address) {
-        printf("FLASH: unsafe raw range 0x%lX..0x%lX (chip=%lu)\n",
-               static_cast<unsigned long>(address),
-               static_cast<unsigned long>(address + bytes),
-               static_cast<unsigned long>(flashBytes));
-        return false;
-    }
-
-    esp_partition_iterator_t iterator = esp_partition_find(
-        ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, nullptr);
-    while (iterator != nullptr) {
-        const esp_partition_t *part = esp_partition_get(iterator);
-        if (part != nullptr && address < part->address + part->size &&
-            part->address < address + bytes) {
-            printf("FLASH: raw range 0x%lX..0x%lX overlaps partition "
-                   "'%s' 0x%lX..0x%lX\n",
-                   static_cast<unsigned long>(address),
-                   static_cast<unsigned long>(address + bytes), part->label,
-                   static_cast<unsigned long>(part->address),
-                   static_cast<unsigned long>(part->address + part->size));
-            esp_partition_iterator_release(iterator);
-            return false;
-        }
-        iterator = esp_partition_next(iterator);
-    }
-    return true;
+    return writeHdMetadata(offset, &record, sizeof(record));
 }
 
 static bool prepareInstallVolume(void) {
-    uint32_t marker[2] = {};
-    uint8_t signature[2] = {};
-    if (!hdInstallStorageIsSafe()) return false;
-    const uint32_t installAddr = hdInstallStorageAddress();
-    const uint32_t installOffset = hdInstallOffset;
-    const bool markerRead = hdCacheUsesPartition
-        ? esp_partition_read(hdCachePartition,
-                             installOffset + INSTALL_800K_BYTES, marker,
-                             sizeof(marker)) == ESP_OK
-        : spi_flash_read(hdInstallStorageMarkerAddress(), marker,
-                         sizeof(marker)) == ESP_OK;
-    const bool signatureRead = hdCacheUsesPartition
-        ? esp_partition_read(hdCachePartition,
-                             installOffset + 1024U, signature,
-                             sizeof(signature)) == ESP_OK
-        : spi_flash_read(installAddr + 1024U, signature,
-                         sizeof(signature)) == ESP_OK;
-    if (!markerRead || !signatureRead ||
-        marker[0] != INSTALL_VALID_MAGIC ||
-        (marker[1] != INSTALL_400K_BYTES && marker[1] != INSTALL_800K_BYTES) ||
-        ((signature[0] != 0x42 || signature[1] != 0x44) &&
-         (signature[0] != 0xD2 || signature[1] != 0xD7))) {
-        return false;
-    }
+    if (installVolume.file != nullptr) return true;
+    if (!sdcardMounted() || !sdcardAcquire(2000)) return false;
 
-    const void *map = nullptr;
-    const esp_err_t mapError = hdCacheUsesPartition
-        ? esp_partition_mmap(hdCachePartition, installOffset,
-                             INSTALL_800K_BYTES, SPI_FLASH_MMAP_DATA,
-                             &map, &installVolume.mapHandle)
-        : spi_flash_mmap(installAddr, INSTALL_800K_BYTES,
-                         SPI_FLASH_MMAP_DATA, &map,
-                         &installVolume.mapHandle);
-    if (mapError != ESP_OK) {
-        printf("INSTALL: flash map failed\n");
+    struct stat info = {};
+    struct stat backupInfo = {};
+    const bool haveImage = stat(INSTALL_IMAGE_PATH, &info) == 0;
+    if (!haveImage &&
+        stat(INSTALL_BACKUP_PATH, &backupInfo) == 0) {
+        rename(INSTALL_BACKUP_PATH, INSTALL_IMAGE_PATH);
+    } else if (haveImage &&
+               stat(INSTALL_BACKUP_PATH, &backupInfo) == 0) {
+        remove(INSTALL_BACKUP_PATH);
+    }
+    uint8_t signature[2] = {};
+    FILE *file = nullptr;
+    const bool sizeValid = stat(INSTALL_IMAGE_PATH, &info) == 0 &&
+        (info.st_size == INSTALL_400K_BYTES ||
+         info.st_size == INSTALL_800K_BYTES);
+    if (sizeValid) file = fopen(INSTALL_IMAGE_PATH, "rb");
+    const bool valid = file != nullptr &&
+        fseek(file, 1024L, SEEK_SET) == 0 &&
+        fread(signature, 1, sizeof(signature), file) == sizeof(signature) &&
+        ((signature[0] == 0x42 && signature[1] == 0x44) ||
+         (signature[0] == 0xD2 && signature[1] == 0xD7));
+    if (!valid) {
+        if (file != nullptr) fclose(file);
+        sdcardRelease();
         return false;
     }
-    installVolume.data = static_cast<const uint8_t *>(map);
-    installVolume.bytes = marker[1];
+    setvbuf(file, nullptr, _IONBF, 0);
+    installVolume.file = file;
+    installVolume.bytes = static_cast<uint32_t>(info.st_size);
     installVolume.isMfs = signature[0] == 0xD2;
-    printf("INSTALL: Flash volume ready for IWM (%luKB %s)\n",
+    sdcardRelease();
+    printf("INSTALL: SD volume ready for IWM (%luKB %s)\n",
            static_cast<unsigned long>(installVolume.bytes / 1024U),
            installVolume.isMfs ? "MFS" : "HFS");
     return true;
 }
 
-const uint8_t *hdGetInstallVolumeData(void) {
-    return installVolume.data;
-}
-
 uint32_t hdGetInstallVolumeBytes(void) {
-    return installVolume.data != nullptr ? installVolume.bytes : 0;
+    return installVolume.file != nullptr ? installVolume.bytes : 0;
 }
 
 int hdIsInstallVolumeMfs(void) {
-    return installVolume.data != nullptr && installVolume.isMfs ? 1 : 0;
+    return installVolume.file != nullptr && installVolume.isMfs ? 1 : 0;
+}
+
+int hdReadInstallSector(uint32_t sector, uint8_t *destination) {
+    if (installVolume.file == nullptr || destination == nullptr ||
+        sector >= installVolume.bytes / 512U || !sdcardAcquire(1000)) {
+        return 0;
+    }
+    const bool ok = fseek(installVolume.file,
+                          static_cast<long>(sector) * 512L, SEEK_SET) == 0 &&
+                    fread(destination, 1, 512, installVolume.file) == 512;
+    sdcardRelease();
+    if (!ok) printf("INSTALL: SD read failed at sector %lu\n",
+                    static_cast<unsigned long>(sector));
+    return ok ? 1 : 0;
 }
 
 struct HdCacheBlock {
@@ -522,8 +411,6 @@ typedef struct {
     char path[32];
     long lastFileOffset; // cached fseek position; -1 = unknown
     const uint8_t *flashData; // raw-flash memory-mapped image (if active)
-    // Flash partition mode (fallback)
-    const esp_partition_t* part;
     int size;
     SemaphoreHandle_t mutex;
     HdCacheBlock cache[HD_CACHE_BLOCK_COUNT];
@@ -803,14 +690,6 @@ static bool readFileBytes(void *context, uint32_t offset, uint8_t *buffer,
            fread(buffer, 1, bytes, file) == bytes;
 }
 
-static bool readPartitionBytes(void *context, uint32_t offset, uint8_t *buffer,
-                               size_t bytes) {
-    const esp_partition_t *part =
-        static_cast<const esp_partition_t *>(context);
-    return part != nullptr && esp_partition_read(part, offset, buffer, bytes) ==
-                                     ESP_OK;
-}
-
 static bool readRawFlashBytes(void *, uint32_t offset, uint8_t *buffer,
                               size_t bytes) {
     return hdRawFlashStorageRead(offset, buffer, bytes);
@@ -826,12 +705,6 @@ static bool macImageHeaderIsValid(FILE *file, long imageSize) {
     return file != nullptr && imageSize > 0 &&
            macImageLayoutIsValid(readFileBytes, file,
                                  static_cast<uint32_t>(imageSize));
-}
-
-static bool macPartitionHeaderIsValid(const esp_partition_t *part) {
-    return part != nullptr && macImageLayoutIsValid(
-                                   readPartitionBytes, const_cast<esp_partition_t *>(part),
-                                   part->size);
 }
 
 bool hdRawFlashImageIsValid(uint32_t imageBytes) {
@@ -918,32 +791,41 @@ static bool reopenSdImage(HdPriv *hd) {
 static bool prepareRawFlashHd(HdPriv *hd) {
     if (hd == nullptr) return false;
     if (!selectHdCacheStorage(0)) {
-        printf("HD: no protected Flash cache partition is available\n");
+        printf("HD: data partition '%s' is missing\n",
+               MACPLUS_DATA_PARTITION_LABEL);
+        showHdStorageError("[FAIL] PARTITION MISSING",
+                           "CREATE 'macplus' IN PMAN");
         return false;
     }
-    const uint32_t cacheBytes = hdCacheImageMax + 4096U;
+    printf("HD: partition '%s' at 0x%lX, %lu bytes (%lu image bytes)\n",
+           hdCachePartition->label,
+           static_cast<unsigned long>(hdCachePartition->address),
+           static_cast<unsigned long>(hdCachePartition->size),
+           static_cast<unsigned long>(hdCacheImageMax));
+
     RawFlashMetadata metadata = {};
     const bool haveMetadata = readRawFlashMetadata(&metadata);
-    uint32_t oldMagic = 0;
-    uint32_t oldFingerprint = 0;
-    const bool haveOldFooter = readOldRawFlashFooter(&oldMagic, &oldFingerprint);
     const uint32_t sdImageBytes = hd->size > 0
                                       ? static_cast<uint32_t>(hd->size)
                                       : 0;
-    const bool preferPinned =
-        (haveMetadata && metadata.magic == HD_RAW_FLASH_PINNED_MAGIC) ||
-        (!haveMetadata && haveOldFooter &&
-         oldMagic == HD_RAW_FLASH_PINNED_MAGIC);
-    uint32_t imageBytes = preferPinned
-                              ? (haveMetadata ? metadata.imageBytes
-                                              : HD_RAW_FLASH_OLD_IMAGE_BYTES)
-                              : sdImageBytes;
-    if (imageBytes == 0) {
-        if (haveMetadata) imageBytes = metadata.imageBytes;
-        else if (haveOldFooter) imageBytes = HD_RAW_FLASH_OLD_IMAGE_BYTES;
-    }
+    const bool preferPinned = haveMetadata &&
+        metadata.magic == HD_RAW_FLASH_PINNED_MAGIC;
+    uint32_t imageBytes = haveMetadata ? metadata.imageBytes : sdImageBytes;
+    if (!preferPinned && sdImageBytes != 0) imageBytes = sdImageBytes;
     if (!rawImageBytesIsValid(imageBytes)) {
-        printf("HD: no valid raw image metadata; using SD/partition mode\n");
+        if (sdImageBytes > hdCacheImageMax) {
+            printf("HD: image needs %lu bytes, partition allows %lu; enlarge "
+                   "'%s' in Launcher PMan\n",
+                   static_cast<unsigned long>(sdImageBytes),
+                   static_cast<unsigned long>(hdCacheImageMax),
+                   MACPLUS_DATA_PARTITION_LABEL);
+            showHdStorageError("[FAIL] PARTITION TOO SMALL",
+                               "ENLARGE 'macplus' IN PMAN");
+        } else {
+            printf("HD: no usable Flash image and no valid /sd/hd.img\n");
+            showHdStorageError("[FAIL] NO SYSTEM DISK",
+                               "COPY /hd.img TO SD CARD");
+        }
         return false;
     }
     hd->size = static_cast<int>(imageBytes);
@@ -952,85 +834,65 @@ static bool prepareRawFlashHd(HdPriv *hd) {
         return true;
     }
 
-    uint32_t sdCrc = 0;
+    uint32_t sdFingerprint = 0;
     bool haveSd = false;
     if (hd->fp != nullptr && !preferPinned) {
         haveSd = true;
         if (!sdcardAcquire(5000)) return false;
-        sdCrc = 0;
-        // Fast fingerprint: first + last sector and the size.  A full 1MB CRC
-        // would take about a minute on this card on every boot.
         uint8_t sector[512];
         if (fseek(hd->fp, 0, SEEK_SET) == 0 &&
             fread(sector, 1, sizeof(sector), hd->fp) == sizeof(sector)) {
-            sdCrc = hdCrc32(sector, sizeof(sector), sdCrc);
+            sdFingerprint = hdCrc32(sector, sizeof(sector), sdFingerprint);
             if (imageBytes > sizeof(sector) &&
                 fseek(hd->fp, static_cast<long>(imageBytes) -
                                   static_cast<long>(sizeof(sector)), SEEK_SET) == 0 &&
                 fread(sector, 1, sizeof(sector), hd->fp) == sizeof(sector)) {
-                sdCrc = hdCrc32(sector, sizeof(sector), sdCrc);
+                sdFingerprint = hdCrc32(sector, sizeof(sector), sdFingerprint);
+            } else if (imageBytes > sizeof(sector)) {
+                haveSd = false;
             }
-            sdCrc ^= imageBytes;
+            sdFingerprint ^= imageBytes;
         } else {
             haveSd = false;
         }
         sdcardRelease();
     }
 
-    bool valid = hdRawFlashImageIsValid(imageBytes);
+    bool valid = haveMetadata && metadata.imageBytes == imageBytes &&
+                 hdRawFlashImageIsValid(imageBytes);
     if (valid && rawFlashJournalHasPending()) {
         printf("HD: interrupted Flash write detected; restoring from SD\n");
         valid = false;
     }
-    uint32_t storedMagic = 0;
-    uint32_t storedCrc = 0;
-    bool haveStored = false;
-    if (haveMetadata && metadata.imageBytes == imageBytes) {
-        storedMagic = metadata.magic;
-        storedCrc = metadata.fingerprint;
-        haveStored = true;
-    } else if (!haveMetadata && imageBytes == HD_RAW_FLASH_OLD_IMAGE_BYTES &&
-               haveOldFooter) {
-        storedMagic = oldMagic;
-        storedCrc = oldFingerprint;
-        haveStored = true;
-    }
-    uint32_t flashCrc = 0;
+    uint32_t flashFingerprint = 0;
     if (valid) {
-        valid = haveStored && rawFlashFingerprint(imageBytes, &flashCrc) &&
-                storedCrc == flashCrc;
+        valid = rawFlashFingerprint(imageBytes, &flashFingerprint) &&
+                metadata.fingerprint == flashFingerprint;
     }
-    // A pinned image is the authoritative copy written by WiFi or by the
-    // emulator's write-back path. Its content CRC may be from an older
-    // firmware revision, so do not reject an otherwise valid image merely
-    // because that optional diagnostic value is stale.
-    if (valid && storedMagic != HD_RAW_FLASH_PINNED_MAGIC) {
-        uint32_t contentCrc = 0;
-        valid = haveMetadata &&
-                rawFlashContentCrc(imageBytes, &contentCrc) &&
-                contentCrc == metadata.contentCrc;
-    }
-    const bool flashPinned = storedMagic == HD_RAW_FLASH_PINNED_MAGIC;
-    if (valid && haveSd && !flashPinned) {
-        valid = storedCrc == sdCrc;
+    if (valid && haveSd && !preferPinned) {
+        valid = metadata.fingerprint == sdFingerprint;
     }
 
     if (!valid) {
         if (hd->fp == nullptr) {
             hd->size = static_cast<int>(sdImageBytes);
+            showHdStorageError("[FAIL] FLASH IMAGE DAMAGED",
+                               "RESTORE /hd.img ON SD");
             return false;
         }
-        printf("HD: copying SD image to raw flash 0x%X (one-time, %u bytes)...\n",
+        printf("HD: copying SD image to partition at 0x%X (%u bytes)...\n",
                static_cast<unsigned int>(hdCacheBase),
                static_cast<unsigned int>(imageBytes));
         if (!sdcardAcquire(5000)) return false;
         uint8_t *copyChunk = hd->cache[0].data;
-        const uint32_t eraseBytes = cacheBytes;
+        const uint32_t eraseBytes = (imageBytes + 4095U) & ~4095U;
         dispShowProgress("HD CACHE INIT", "[RUN] PREPARING FLASH",
                          "DO NOT POWER OFF", 0, eraseBytes);
         // Erase in moderate chunks so the first-boot activity marker keeps
         // changing instead of appearing frozen during one long erase call.
-        bool ok = true;
+        // Invalidate the old image before touching its data. A reset during
+        // this copy must never leave stale metadata pointing at a partial image.
+        bool ok = eraseHdMetadata();
         for (uint32_t erased = 0; ok && erased < eraseBytes; erased += 0x10000U) {
             const uint32_t left = eraseBytes - erased;
             const uint32_t chunk = left < 0x10000U ? left : 0x10000U;
@@ -1068,27 +930,24 @@ static bool prepareRawFlashHd(HdPriv *hd) {
         }
         sdcardRelease();
         if (!ok) {
-            printf("HD: raw flash copy failed; keeping SD mode\n");
+            printf("HD: Flash copy failed; hard disk unavailable\n");
             const char *lines[] = {
                 "HD CACHE",
                 "[FAIL] COPY ERROR",
-                "USING SD CARD",
+                "CHECK SD CARD AND REBOOT",
             };
             dispShowMessage(lines, 3);
             return false;
         }
         dispShowHdCacheProgress(imageBytes, imageBytes);
-        printf("HD: raw flash copy complete\n");
+        printf("HD: Flash copy complete\n");
     }
 
     const size_t mapBytes = (static_cast<size_t>(hd->size) + 0xFFFFU) &
                             ~static_cast<size_t>(0xFFFFU);
-    const esp_err_t mapError = hdCacheUsesPartition
-        ? esp_partition_mmap(hdCachePartition, 0, mapBytes,
-                             SPI_FLASH_MMAP_DATA, &hdFlashMap,
-                             &hdFlashMapHandle)
-        : spi_flash_mmap(hdCacheBase, mapBytes, SPI_FLASH_MMAP_DATA,
-                         &hdFlashMap, &hdFlashMapHandle);
+    const esp_err_t mapError = esp_partition_mmap(
+        hdCachePartition, MACPLUS_HD_DATA_OFFSET, mapBytes,
+        SPI_FLASH_MMAP_DATA, &hdFlashMap, &hdFlashMapHandle);
     if (mapError != ESP_OK) {
         printf("HD: Flash cache mmap failed; hard disk unavailable\n");
         return false;
@@ -1108,20 +967,9 @@ void hdInvalidateRawCache(void) {
         printf("HD: no protected Flash cache storage; not erasing it\n");
         return;
     }
-    RawFlashMetadata metadata = {};
-    const bool haveMetadata = readRawFlashMetadata(&metadata);
-    const bool haveOldFooter = !haveMetadata &&
-                               readOldRawFlashFooter(nullptr, nullptr);
-    const esp_err_t metadataError =
-        eraseHdCache(hdCacheImageMax,
-                     HD_RAW_FLASH_METADATA_BYTES);
-    const esp_err_t oldFooterError = haveOldFooter
-        ? eraseHdCache(HD_RAW_FLASH_OLD_IMAGE_BYTES, 4096U)
-        : ESP_OK;
-    printf("HD: raw flash cache invalidated (err=%d); will recopy from SD "
-           "on next boot\n", static_cast<int>(metadataError != ESP_OK
-                                                    ? metadataError
-                                                    : oldFooterError));
+    const bool ok = eraseHdMetadata();
+    printf("HD: Flash image metadata invalidated (%s); /sd/hd.img will be "
+           "copied on next boot\n", ok ? "OK" : "ERROR");
 }
 
 static bool readSdImage(HdPriv *hd, unsigned int lba, uint8_t *buffer,
@@ -1312,26 +1160,6 @@ static int chooseCacheBlock(const HdPriv *hd) {
     return selected;
 }
 
-static bool writeFlashBlock(HdPriv *hd, uint32_t blockIndex,
-                            const uint8_t *data) {
-    if (hd->part == nullptr || cacheBlockBytes(hd, blockIndex) !=
-                              HD_CACHE_BLOCK_BYTES) {
-        hd->lastIoError = EINVAL;
-        return false;
-    }
-
-    const size_t offset = static_cast<size_t>(blockIndex) *
-                          HD_CACHE_BLOCK_BYTES;
-    esp_err_t error = esp_partition_erase_range(
-        hd->part, offset, HD_CACHE_BLOCK_BYTES);
-    if (error == ESP_OK) {
-        error = esp_partition_write(hd->part, offset, data,
-                                    HD_CACHE_BLOCK_BYTES);
-    }
-    hd->lastIoError = static_cast<uint32_t>(error);
-    return error == ESP_OK;
-}
-
 static bool rawFlashBlockMatches(uint32_t offset, const uint8_t *data) {
     uint8_t verify[512];
     for (size_t part = 0; part < HD_CACHE_BLOCK_BYTES; part += sizeof(verify)) {
@@ -1401,72 +1229,14 @@ static bool flushFlashRawBlock(HdPriv *hd, HdCacheBlock *block) {
 static bool flushCache(HdPriv *hd) {
     if (hd == nullptr || hd->dirtyBlocks == 0) return true;
 
-    // A card can remain readable after its FAT volume refuses write access.
-    // Keep the emulator usable in that case instead of selecting an unrelated
-    // flash image or repeatedly retrying writes that can never succeed.  Dirty
-    // sectors remain visible through the RAM cache until eviction; they are
-    // deliberately discarded on flush and the read-only state is reported to
-    // the host through BLE/HTTP diagnostics.
-    if (hd->readOnly) {
-        for (size_t index = 0; index < HD_CACHE_BLOCK_COUNT; ++index) {
-            hd->cache[index].dirty = false;
-        }
-        hd->dirtyBlocks = 0;
-        hd->lastFlushMs = millis();
-        return true;
-    }
-
     bool ok = true;
     for (size_t index = 0; index < HD_CACHE_BLOCK_COUNT; ++index) {
         HdCacheBlock &block = hd->cache[index];
         if (!block.valid || !block.dirty) continue;
 
-        if (hd->flashData != nullptr) {
-            if (!flushFlashRawBlock(hd, &block)) {
-                ok = false;
-                break;
-            }
-            continue;
-        }
-
-        const size_t bytes = cacheBlockBytes(hd, block.blockIndex);
-        const unsigned int lba =
-            block.blockIndex * (HD_CACHE_BLOCK_BYTES / 512U);
-        bool writeOk = true;
-        if (hd->path[0] != '\0') {
-            writeOk = writeSdRange(hd, lba, block.data, bytes, false);
-        } else {
-            writeOk = writeFlashBlock(hd, block.blockIndex, block.data);
-        }
-        if (bytes == 0 || !writeOk) {
+        if (!flushFlashRawBlock(hd, &block)) {
             ok = false;
             break;
-        }
-        block.dirty = false;
-        if (hd->dirtyBlocks != 0) --hd->dirtyBlocks;
-    }
-
-    if (ok && hd->path[0] != '\0') {
-        if (!sdcardAcquire(5000)) {
-            hd->lastIoError = EBUSY;
-            recordFirstFailure(hd, 7, 0, 0, 0, -1, 0, 0, EBUSY);
-            markStorageOffline(hd, hd->lastIoError);
-            ok = false;
-        } else {
-            errno = 0;
-            const int flushResult = fflush(hd->fp);
-            const int savedErrno = errno;
-            const int streamError = ferror(hd->fp);
-            if (flushResult != 0 || streamError != 0) {
-                hd->lastIoError = savedErrno != 0
-                    ? static_cast<uint32_t>(savedErrno)
-                    : static_cast<uint32_t>(EIO);
-                recordFirstFailure(hd, 8, 0, 0, 0, 0, flushResult,
-                                   streamError, savedErrno);
-                markStorageOffline(hd, hd->lastIoError);
-                ok = false;
-            }
-            sdcardRelease();
         }
     }
 
@@ -1521,19 +1291,11 @@ static HdCacheBlock *loadCacheBlock(HdPriv *hd, uint32_t blockIndex) {
     }
     memset(block.data, 0, sizeof(block.data));
 
-    const unsigned int lba = blockIndex * (HD_CACHE_BLOCK_BYTES / 512U);
     bool ok = false;
-    if (hd->path[0] != '\0') {
-        ok = readSdImage(hd, lba, block.data, bytes);
-    } else if (hd->flashData != nullptr) {
+    if (hd->flashData != nullptr) {
         memcpy(block.data,
                hd->flashData + blockIndex * HD_CACHE_BLOCK_BYTES, bytes);
         ok = true;
-    } else if (hd->part != nullptr) {
-        const esp_err_t error = esp_partition_read(
-            hd->part, blockIndex * HD_CACHE_BLOCK_BYTES, block.data, bytes);
-        hd->lastIoError = static_cast<uint32_t>(error);
-        ok = error == ESP_OK;
     }
     if (!ok) {
         block.valid = false;
@@ -1556,13 +1318,6 @@ static bool readImageCached(HdPriv *hd, unsigned int lba, uint8_t *buffer,
         memcpy(buffer, hd->flashData + static_cast<size_t>(lba) * 512U, bytes);
         hd->lastReadPrefix = firstFourBytes(buffer, bytes);
         return true;
-    }
-
-    // Large SCSI reads (16KB chunks) bypass the small cache entirely: one
-    // seek + a few 2KB freads is much faster than walking the cache block by
-    // block, and it keeps the 68000 stall short while loading applications.
-    if (bytes >= 4096 && hd->path[0] != '\0') {
-        return readSdImage(hd, lba, buffer, bytes);
     }
 
     size_t remaining = bytes;
@@ -1775,9 +1530,7 @@ static int hdScsiCmd(SCSITransferData *data, unsigned int cmd,
             printf("HD: invalid read LBA=%u sectors=%u bytes=%u capacity=%u image=%d\n",
                    lba, len, static_cast<unsigned int>(bytes),
                    static_cast<unsigned int>(data->dataCapacity), hd->size);
-        } else if ((hd->path[0] != '\0' || hd->part != nullptr ||
-                    hd->flashData != nullptr) &&
-                   lockHd(hd)) {
+        } else if (hd->flashData != nullptr && lockHd(hd)) {
             commandOk = readExportedImage(hd, lba, data->data, bytes);
             unlockHd(hd);
             if (!commandOk) {
@@ -1811,9 +1564,7 @@ static int hdScsiCmd(SCSITransferData *data, unsigned int cmd,
             printf("HD: invalid write LBA=%u sectors=%u bytes=%u capacity=%u image=%d\n",
                    lba, len, static_cast<unsigned int>(bytes),
                    static_cast<unsigned int>(data->dataCapacity), hd->size);
-        } else if ((hd->path[0] != '\0' || hd->part != nullptr ||
-                    hd->flashData != nullptr) &&
-                   lockHd(hd)) {
+        } else if (hd->flashData != nullptr && lockHd(hd)) {
             commandOk = writeExportedBaseImage(hd, lba, data->data, bytes);
             unlockHd(hd);
             if (!commandOk) {
@@ -2001,6 +1752,7 @@ SCSIDevice *hdCreate(void) {
         }
         hd->path[0] = '\0';
         hd->usingSd = false;
+        hd->readOnly = false;
         hd->ready = true;
         printf("HD: Using raw flash image at 0x%X (%d bytes, read/write)\n",
                static_cast<unsigned int>(hdCacheBase), hd->size);
@@ -2014,30 +1766,12 @@ SCSIDevice *hdCreate(void) {
         printf("HD: Flash cache unavailable; SD random I/O disabled\n");
     }
 
-    // A named macplus partition is the protected raw-cache container, not a
-    // second SCSI image.  Never expose it wholesale after a failed cache
-    // validation; doing so would let a torn block reach the boot driver.
-    if (!hd->fp && hd->flashData == nullptr && !hdCacheUsesPartition) {
-        hd->part=esp_partition_find_first((esp_partition_type_t)0x40, (esp_partition_subtype_t)0x02, NULL);
-        if (hd->part==0) {
-            printf("HD: No SD card image and no flash partition!\n");
-        } else {
-            hd->size=hd->part->size;
-            hd->lastIoError = 0;
-            if (macPartitionHeaderIsValid(hd->part)) {
-                hd->ready = true;
-                printf("HD: Using flash partition (%d bytes)\n", hd->size);
-            } else {
-                hd->size = 0;
-                hd->lastIoError = EINVAL;
-                printf("HD: refusing blank/invalid flash HD partition\n");
-            }
-        }
-    } else if (!hd->fp && hd->flashData == nullptr && hdCacheUsesPartition) {
+    if (!hd->fp && hd->flashData == nullptr) {
         hd->ready = false;
         hd->size = 0;
         hd->lastIoError = EIO;
-        printf("HD: protected Flash cache unavailable; refusing raw partition fallback\n");
+        printf("HD: hard disk unavailable; only the named '%s' partition is allowed\n",
+               MACPLUS_DATA_PARTITION_LABEL);
     }
 
     if (hd->ready) prepareInstallVolume();
