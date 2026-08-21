@@ -186,10 +186,10 @@ void setup() {
     }
     MACPLUS_LOG("Mac RAM reserved at %p (%d bytes)\n", macRam, TME_RAMSIZE);
     // Defer speaker allocation until after the contiguous Mac RAM block is
-    // reserved. sndInit() starts the M5Unified speaker service later. The
-    // emulator path needs the Cardputer-Adv internal speaker enabled; the
-    // WiFi transfer path above deliberately keeps it disabled.
-    initCardputerHardware(true, false);
+    // reserved. sndInit() configures the speaker and codec itself, so the
+    // ES8311 does not get enabled abruptly by M5Unified during board setup.
+    // The WiFi transfer path above deliberately keeps the speaker disabled.
+    initCardputerHardware(false, false);
     bool sdReady = sdcardInit();
     for (int attempt = 0; !sdReady && attempt < 2; ++attempt) {
         delay(100);
