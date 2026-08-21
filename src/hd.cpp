@@ -1,3 +1,4 @@
+#include "debug_log.h"
 /* SCSI hard disk backed by the named `macplus` data partition. */
 #include <stdio.h>
 #include <stdint.h>
@@ -7,7 +8,6 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <Arduino.h>
-#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_partition.h"
 #include "freertos/FreeRTOS.h"
@@ -49,9 +49,18 @@ static constexpr uint32_t INSTALL_400K_BYTES =
     MACPLUS_INSTALL_400K_BYTES;
 static constexpr uint32_t INSTALL_800K_BYTES =
     MACPLUS_INSTALL_800K_BYTES;
+// IWM requests sectors in Macintosh interleave order (0,6,1,7,...). Reading
+// one 512-byte sector with a fresh fseek for every request makes FatFS repeat
+// the same SD lookup many times while Finder scans an HFS catalog. One 8 KiB
+// window covers a complete outer-track side (12 sectors) within the no-PSRAM
+// memory budget.
+static constexpr size_t INSTALL_READ_CACHE_BYTES = 8 * 1024;
+static_assert((INSTALL_READ_CACHE_BYTES % 512U) == 0,
+              "install read cache must be sector aligned");
 static constexpr const char *INSTALL_IMAGE_PATH = "/sd/macplus-install.img";
 static constexpr const char *INSTALL_BACKUP_PATH =
     "/sd/macplus-install.backup";
+static constexpr const char *INSTALL_TEMP_PATH = "/sd/macplus-install.upload";
 static const void *hdFlashMap = nullptr;
 static spi_flash_mmap_handle_t hdFlashMapHandle = 0;
 static const esp_partition_t *hdCachePartition = nullptr;
@@ -63,9 +72,18 @@ struct InstallVolume {
     FILE *file;
     uint32_t bytes;
     bool isMfs;
+    bool readOnly;
 };
 
 static InstallVolume installVolume = {};
+static uint8_t installReadCache[INSTALL_READ_CACHE_BYTES];
+static uint8_t installWarmupSector[512];
+struct InstallReadCache {
+    uint32_t baseSector;
+    uint32_t sectorCount;
+    bool valid;
+};
+static InstallReadCache installReadCacheState = {};
 
 struct RawFlashMetadata {
     uint32_t magic;
@@ -346,26 +364,59 @@ static bool prepareInstallVolume(void) {
     const bool sizeValid = stat(INSTALL_IMAGE_PATH, &info) == 0 &&
         (info.st_size == INSTALL_400K_BYTES ||
          info.st_size == INSTALL_800K_BYTES);
-    if (sizeValid) file = fopen(INSTALL_IMAGE_PATH, "rb");
+    if (!sizeValid) {
+        MACPLUS_LOG("INSTALL: missing or invalid image size=%ld errno=%d\n",
+               static_cast<long>(info.st_size), errno);
+    }
+    int openError = 0;
+    if (sizeValid) {
+        errno = 0;
+        file = fopen(INSTALL_IMAGE_PATH, "r+b");
+        openError = errno;
+    }
+    bool readOnly = false;
+    if (file == nullptr && sizeValid) {
+        // A physically or FAT-level write-protected card can still expose the
+        // software disk for reading.  Report that state to the Mac instead of
+        // pretending a writable disk is available.
+        errno = 0;
+        file = fopen(INSTALL_IMAGE_PATH, "rb");
+        if (openError == 0) openError = errno;
+        readOnly = file != nullptr;
+    }
     const bool valid = file != nullptr &&
         fseek(file, 1024L, SEEK_SET) == 0 &&
         fread(signature, 1, sizeof(signature), file) == sizeof(signature) &&
         ((signature[0] == 0x42 && signature[1] == 0x44) ||
          (signature[0] == 0xD2 && signature[1] == 0xD7));
     if (!valid) {
+        if (file == nullptr && sizeValid) {
+            MACPLUS_LOG("INSTALL: cannot open %s (errno=%d)\n",
+                   INSTALL_IMAGE_PATH, openError);
+        }
         if (file != nullptr) fclose(file);
         sdcardRelease();
         return false;
     }
-    setvbuf(file, nullptr, _IONBF, 0);
+    // Use a buffered stream so each 8 KiB cache fill is handled as a
+    // multi-sector FatFS read instead of many tiny stdio transactions.
+    setvbuf(file, nullptr, _IOFBF, INSTALL_READ_CACHE_BYTES);
     installVolume.file = file;
     installVolume.bytes = static_cast<uint32_t>(info.st_size);
     installVolume.isMfs = signature[0] == 0xD2;
+    installVolume.readOnly = readOnly;
+    memset(&installReadCacheState, 0, sizeof(installReadCacheState));
     sdcardRelease();
-    printf("INSTALL: SD volume ready for IWM (%luKB %s)\n",
+    MACPLUS_LOG("INSTALL: SD volume ready for IWM (%luKB %s)\n",
            static_cast<unsigned long>(installVolume.bytes / 1024U),
            installVolume.isMfs ? "MFS" : "HFS");
+    MACPLUS_LOG("INSTALL: media %s\n", installVolume.readOnly ?
+           "read-only" : "read/write");
     return true;
+}
+
+bool hdPrepareInstallVolume(void) {
+    return prepareInstallVolume();
 }
 
 uint32_t hdGetInstallVolumeBytes(void) {
@@ -376,18 +427,147 @@ int hdIsInstallVolumeMfs(void) {
     return installVolume.file != nullptr && installVolume.isMfs ? 1 : 0;
 }
 
+int hdIsInstallVolumeReadOnly(void) {
+    return installVolume.file == nullptr || installVolume.readOnly ? 1 : 0;
+}
+
 int hdReadInstallSector(uint32_t sector, uint8_t *destination) {
     if (installVolume.file == nullptr || destination == nullptr ||
-        sector >= installVolume.bytes / 512U || !sdcardAcquire(1000)) {
+        sector >= installVolume.bytes / 512U) {
         return 0;
     }
-    const bool ok = fseek(installVolume.file,
-                          static_cast<long>(sector) * 512L, SEEK_SET) == 0 &&
-                    fread(destination, 1, 512, installVolume.file) == 512;
-    sdcardRelease();
-    if (!ok) printf("INSTALL: SD read failed at sector %lu\n",
+
+    const uint32_t cacheSectors = INSTALL_READ_CACHE_BYTES / 512U;
+    const bool cached = installReadCacheState.valid &&
+        sector >= installReadCacheState.baseSector &&
+        sector - installReadCacheState.baseSector <
+            installReadCacheState.sectorCount;
+    bool ok = true;
+    if (!cached) {
+        if (!sdcardAcquire(1000)) return 0;
+        // The IWM primes a track from its first sector.  Start the window at
+        // that request instead of aligning to an arbitrary 16-sector FAT
+        // boundary: 400K tracks contain 12 sectors and 800K sides contain
+        // 12 sectors, so alignment otherwise makes one track cross two SD
+        // reads on nearly every seek.
+        const uint32_t base = sector;
+        const uint32_t totalSectors = installVolume.bytes / 512U;
+        const uint32_t count = (totalSectors - base) < cacheSectors
+                                   ? totalSectors - base : cacheSectors;
+        ok = fseek(installVolume.file, static_cast<long>(base) * 512L,
+                   SEEK_SET) == 0 &&
+             fread(installReadCache, 512U, count,
+                   installVolume.file) == count;
+        if (ok) {
+            installReadCacheState.baseSector = base;
+            installReadCacheState.sectorCount = count;
+            installReadCacheState.valid = true;
+        } else {
+            installReadCacheState.valid = false;
+            installReadCacheState.sectorCount = 0;
+        }
+        sdcardRelease();
+    }
+    if (ok) {
+        memcpy(destination, installReadCache +
+                   (sector - installReadCacheState.baseSector) * 512U,
+               512U);
+    }
+    if (!ok) MACPLUS_LOG("INSTALL: SD read failed at sector %lu\n",
                     static_cast<unsigned long>(sector));
     return ok ? 1 : 0;
+}
+
+int hdWriteInstallSector(uint32_t sector, const uint8_t *source) {
+    if (installVolume.file == nullptr || installVolume.readOnly ||
+        source == nullptr || sector >= installVolume.bytes / 512U) {
+        return 0;
+    }
+    if (!sdcardAcquire(1000)) return 0;
+    const bool ok = fseek(installVolume.file, static_cast<long>(sector) * 512L,
+                          SEEK_SET) == 0 &&
+                    fwrite(source, 1, 512U, installVolume.file) == 512U;
+    sdcardRelease();
+    if (ok) {
+        if (installReadCacheState.valid &&
+            sector >= installReadCacheState.baseSector &&
+            sector - installReadCacheState.baseSector <
+                installReadCacheState.sectorCount) {
+            memcpy(installReadCache +
+                       (sector - installReadCacheState.baseSector) * 512U,
+                   source, 512U);
+        }
+    }
+    if (!ok) {
+        MACPLUS_LOG("INSTALL: SD write failed at sector %lu\n",
+               static_cast<unsigned long>(sector));
+    }
+    return ok ? 1 : 0;
+}
+
+int hdReadInstallBytes(uint32_t offset, uint8_t *destination, uint32_t bytes) {
+    if (destination == nullptr || (offset & 511U) != 0U ||
+        (bytes & 511U) != 0U ||
+        offset > installVolume.bytes || bytes > installVolume.bytes - offset) {
+        return 0;
+    }
+    uint32_t sector = offset / 512U;
+    while (bytes != 0U) {
+        if (!hdReadInstallSector(sector++, destination)) return 0;
+        destination += 512U;
+        bytes -= 512U;
+    }
+    return 1;
+}
+
+int hdWriteInstallBytes(uint32_t offset, const uint8_t *source, uint32_t bytes) {
+    if (installVolume.file == nullptr || installVolume.readOnly ||
+        source == nullptr || (offset & 511U) != 0U ||
+        (bytes & 511U) != 0U || offset > installVolume.bytes ||
+        bytes > installVolume.bytes - offset) {
+        return 0;
+    }
+    if (bytes == 0U) return 1;
+    if (!sdcardAcquire(2000)) return 0;
+    const bool ok = fseek(installVolume.file, static_cast<long>(offset), SEEK_SET) == 0 &&
+                    fwrite(source, 1, bytes, installVolume.file) == bytes;
+    sdcardRelease();
+    if (!ok) {
+        MACPLUS_LOG("INSTALL: SD write failed at offset %lu (%lu bytes)\n",
+               static_cast<unsigned long>(offset),
+               static_cast<unsigned long>(bytes));
+        return 0;
+    }
+
+    const uint32_t firstSector = offset / 512U;
+    const uint32_t sectors = bytes / 512U;
+    if (installReadCacheState.valid) {
+        const uint32_t cacheEnd = installReadCacheState.baseSector +
+                                  installReadCacheState.sectorCount;
+        const uint32_t writeEnd = firstSector + sectors;
+        const uint32_t begin = firstSector > installReadCacheState.baseSector
+            ? firstSector : installReadCacheState.baseSector;
+        const uint32_t end = writeEnd < cacheEnd ? writeEnd : cacheEnd;
+        if (begin < end) {
+            memcpy(installReadCache +
+                       (begin - installReadCacheState.baseSector) * 512U,
+                   source + (begin - firstSector) * 512U,
+                   (end - begin) * 512U);
+        }
+    }
+    return 1;
+}
+
+int hdFlushInstallVolume(void) {
+    if (installVolume.file == nullptr || installVolume.readOnly) return 0;
+    if (!sdcardAcquire(2000)) return 0;
+    const int result = fflush(installVolume.file);
+    sdcardRelease();
+    if (result != 0) {
+        MACPLUS_LOG("INSTALL: SD flush failed (errno=%d)\n", errno);
+        return 0;
+    }
+    return 1;
 }
 
 struct HdCacheBlock {
@@ -417,18 +597,7 @@ typedef struct {
     uint32_t cacheClock;
     uint32_t dirtyBlocks;
     uint32_t lastFlushMs;
-    volatile uint32_t readSectors;
-    volatile uint32_t writeSectors;
-    volatile uint32_t commandCount;
-    volatile uint32_t unrecognizedCommandCount;
-    volatile uint32_t lastCommand;
-    volatile uint32_t lastLba;
-    volatile uint32_t lastLength;
-    volatile uint32_t readErrorCount;
-    volatile uint32_t writeErrorCount;
-    volatile uint32_t seekErrorCount;
     volatile uint32_t lastIoError;
-    volatile uint32_t lastReadPrefix;
     // Preserve the first failed stdio operation. Later SCSI requests after
     // the image is disabled must not overwrite the useful root cause.
     volatile uint32_t firstFailureStage;
@@ -463,7 +632,6 @@ typedef struct {
 
 static HdPriv *activeHd = nullptr;
 static TaskHandle_t flushTaskHandle = nullptr;
-static volatile uint32_t hdReadIOMicros = 0;
 static HdPriv *reservedHd = nullptr;
 static SCSIDevice *reservedDev = nullptr;
 
@@ -477,7 +645,7 @@ void hdReserveStorage(void) {
     if (reservedDev == nullptr) {
         reservedDev = static_cast<SCSIDevice *>(malloc(sizeof(SCSIDevice)));
     }
-    printf("HD: reserved storage %s%s\n",
+    MACPLUS_LOG("HD: reserved storage %s%s\n",
            reservedHd != nullptr ? "hd" : "hd-FAIL",
            reservedDev != nullptr ? "+dev" : "+dev-FAIL");
 }
@@ -496,26 +664,14 @@ static bool readImageCached(HdPriv *hd, unsigned int lba, uint8_t *buffer,
 static bool writeImageCached(HdPriv *hd, unsigned int lba,
                              const uint8_t *buffer, size_t bytes);
 
-uint32_t hdGetReadSectors(void) { return activeHd ? activeHd->readSectors : 0; }
-uint32_t hdGetReadIOMicros(void) { return hdReadIOMicros; }
 const uint8_t *hdGetRawFlashData(void) {
     return static_cast<const uint8_t *>(hdFlashMap);
 }
-uint32_t hdGetWriteSectors(void) { return activeHd ? activeHd->writeSectors : 0; }
 uint32_t hdGetImageSize(void) { return activeHd ? activeHd->size : 0; }
 int hdIsReady(void) { return activeHd && activeHd->ready && !activeHd->externalBusy ? 1 : 0; }
 int hdIsUsingSd(void) { return activeHd && activeHd->usingSd ? 1 : 0; }
 int hdIsReadOnly(void) { return activeHd && activeHd->readOnly ? 1 : 0; }
-uint32_t hdGetCommandCount(void) { return activeHd ? activeHd->commandCount : 0; }
-uint32_t hdGetUnrecognizedCommandCount(void) { return activeHd ? activeHd->unrecognizedCommandCount : 0; }
-uint32_t hdGetLastCommand(void) { return activeHd ? activeHd->lastCommand : 0; }
-uint32_t hdGetLastLba(void) { return activeHd ? activeHd->lastLba : 0; }
-uint32_t hdGetLastLength(void) { return activeHd ? activeHd->lastLength : 0; }
-uint32_t hdGetReadErrorCount(void) { return activeHd ? activeHd->readErrorCount : 0; }
-uint32_t hdGetWriteErrorCount(void) { return activeHd ? activeHd->writeErrorCount : 0; }
-uint32_t hdGetSeekErrorCount(void) { return activeHd ? activeHd->seekErrorCount : 0; }
 uint32_t hdGetLastIoError(void) { return activeHd ? activeHd->lastIoError : 0; }
-uint32_t hdGetLastReadPrefix(void) { return activeHd ? activeHd->lastReadPrefix : 0; }
 uint32_t hdGetFirstFailureStage(void) {
     return activeHd ? activeHd->firstFailureStage : 0;
 }
@@ -608,14 +764,6 @@ static const uint8_t inq_resp[95]={
     '2','0','S','C',' ',' ',' ',' ', //prod id
     '1','.','0',' ',' ',' ',' ',' ', //prod rev lvl
 };
-
-static uint32_t firstFourBytes(const uint8_t *data, size_t length) {
-    uint32_t value = 0;
-    for (size_t i = 0; i < 4; ++i) {
-        value = (value << 8) | (i < length ? data[i] : 0);
-    }
-    return value;
-}
 
 static uint32_t readBe32(const uint8_t *data) {
     return (static_cast<uint32_t>(data[0]) << 24) |
@@ -760,7 +908,7 @@ static void markStorageOffline(HdPriv *hd, uint32_t error) {
     hd->usingSd = false;
     hd->offlineError = error;
     hd->lastIoError = error;
-    printf("HD: %s image disabled after I/O failure, errno=%lu; reboot required\n",
+    MACPLUS_LOG("HD: %s image disabled after I/O failure, errno=%lu; reboot required\n",
            hd->primary ? "primary" : "shared", static_cast<unsigned long>(error));
 }
 
@@ -791,13 +939,13 @@ static bool reopenSdImage(HdPriv *hd) {
 static bool prepareRawFlashHd(HdPriv *hd) {
     if (hd == nullptr) return false;
     if (!selectHdCacheStorage(0)) {
-        printf("HD: data partition '%s' is missing\n",
+        MACPLUS_LOG("HD: data partition '%s' is missing\n",
                MACPLUS_DATA_PARTITION_LABEL);
         showHdStorageError("[FAIL] PARTITION MISSING",
                            "CREATE 'macplus' IN PMAN");
         return false;
     }
-    printf("HD: partition '%s' at 0x%lX, %lu bytes (%lu image bytes)\n",
+    MACPLUS_LOG("HD: partition '%s' at 0x%lX, %lu bytes (%lu image bytes)\n",
            hdCachePartition->label,
            static_cast<unsigned long>(hdCachePartition->address),
            static_cast<unsigned long>(hdCachePartition->size),
@@ -814,7 +962,7 @@ static bool prepareRawFlashHd(HdPriv *hd) {
     if (!preferPinned && sdImageBytes != 0) imageBytes = sdImageBytes;
     if (!rawImageBytesIsValid(imageBytes)) {
         if (sdImageBytes > hdCacheImageMax) {
-            printf("HD: image needs %lu bytes, partition allows %lu; enlarge "
+            MACPLUS_LOG("HD: image needs %lu bytes, partition allows %lu; enlarge "
                    "'%s' in Launcher PMan\n",
                    static_cast<unsigned long>(sdImageBytes),
                    static_cast<unsigned long>(hdCacheImageMax),
@@ -822,7 +970,7 @@ static bool prepareRawFlashHd(HdPriv *hd) {
             showHdStorageError("[FAIL] PARTITION TOO SMALL",
                                "ENLARGE 'macplus' IN PMAN");
         } else {
-            printf("HD: no usable Flash image and no valid /sd/hd.img\n");
+            MACPLUS_LOG("HD: no usable Flash image and no valid /sd/hd.img\n");
             showHdStorageError("[FAIL] NO SYSTEM DISK",
                                "COPY /hd.img TO SD CARD");
         }
@@ -861,7 +1009,7 @@ static bool prepareRawFlashHd(HdPriv *hd) {
     bool valid = haveMetadata && metadata.imageBytes == imageBytes &&
                  hdRawFlashImageIsValid(imageBytes);
     if (valid && rawFlashJournalHasPending()) {
-        printf("HD: interrupted Flash write detected; restoring from SD\n");
+        MACPLUS_LOG("HD: interrupted Flash write detected; restoring from SD\n");
         valid = false;
     }
     uint32_t flashFingerprint = 0;
@@ -880,7 +1028,7 @@ static bool prepareRawFlashHd(HdPriv *hd) {
                                "RESTORE /hd.img ON SD");
             return false;
         }
-        printf("HD: copying SD image to partition at 0x%X (%u bytes)...\n",
+        MACPLUS_LOG("HD: copying SD image to partition at 0x%X (%u bytes)...\n",
                static_cast<unsigned int>(hdCacheBase),
                static_cast<unsigned int>(imageBytes));
         if (!sdcardAcquire(5000)) return false;
@@ -930,7 +1078,7 @@ static bool prepareRawFlashHd(HdPriv *hd) {
         }
         sdcardRelease();
         if (!ok) {
-            printf("HD: Flash copy failed; hard disk unavailable\n");
+            MACPLUS_LOG("HD: Flash copy failed; hard disk unavailable\n");
             const char *lines[] = {
                 "HD CACHE",
                 "[FAIL] COPY ERROR",
@@ -940,7 +1088,7 @@ static bool prepareRawFlashHd(HdPriv *hd) {
             return false;
         }
         dispShowHdCacheProgress(imageBytes, imageBytes);
-        printf("HD: Flash copy complete\n");
+        MACPLUS_LOG("HD: Flash copy complete\n");
     }
 
     const size_t mapBytes = (static_cast<size_t>(hd->size) + 0xFFFFU) &
@@ -949,12 +1097,12 @@ static bool prepareRawFlashHd(HdPriv *hd) {
         hdCachePartition, MACPLUS_HD_DATA_OFFSET, mapBytes,
         SPI_FLASH_MMAP_DATA, &hdFlashMap, &hdFlashMapHandle);
     if (mapError != ESP_OK) {
-        printf("HD: Flash cache mmap failed; hard disk unavailable\n");
+        MACPLUS_LOG("HD: Flash cache mmap failed; hard disk unavailable\n");
         return false;
     }
     hd->flashData = static_cast<const uint8_t *>(hdFlashMap);
     hd->lastIoError = 0;
-    printf("HD: raw flash image mapped at %p (%d bytes)\n",
+    MACPLUS_LOG("HD: raw flash image mapped at %p (%d bytes)\n",
            hd->flashData, hd->size);
     return true;
 }
@@ -962,27 +1110,47 @@ static bool prepareRawFlashHd(HdPriv *hd) {
 // Invalidate the raw-flash HD cache (removes the completion magic).  The
 // next boot re-copies /sd/hd.img from the SD card, so an updated image takes
 // effect without reflashing the firmware.
-void hdInvalidateRawCache(void) {
-    if (!selectHdCacheStorage(0)) {
-        printf("HD: no protected Flash cache storage; not erasing it\n");
-        return;
+bool hdInvalidateRawCache(void) {
+    if (!selectHdCacheStorage(0)) return false;
+    return eraseHdMetadata();
+}
+
+bool hdRemoveInstallImage(void) {
+    if (!sdcardMounted() || !sdcardAcquire(2000)) return false;
+
+    if (installVolume.file != nullptr) {
+        fflush(installVolume.file);
+        fclose(installVolume.file);
+        installVolume.file = nullptr;
+        installVolume.bytes = 0;
+        installVolume.isMfs = false;
+        installVolume.readOnly = false;
+        memset(&installReadCacheState, 0, sizeof(installReadCacheState));
     }
-    const bool ok = eraseHdMetadata();
-    printf("HD: Flash image metadata invalidated (%s); /sd/hd.img will be "
-           "copied on next boot\n", ok ? "OK" : "ERROR");
+
+    bool ok = true;
+    const char *paths[] = {
+        INSTALL_IMAGE_PATH,
+        INSTALL_BACKUP_PATH,
+        INSTALL_TEMP_PATH,
+    };
+    for (const char *path : paths) {
+        errno = 0;
+        if (remove(path) != 0 && errno != ENOENT) ok = false;
+    }
+    sdcardRelease();
+    return ok;
 }
 
 static bool readSdImage(HdPriv *hd, unsigned int lba, uint8_t *buffer,
                         size_t bytes) {
-    const int64_t ioStartUs = esp_timer_get_time();
     const long offset = static_cast<long>(static_cast<uint64_t>(lba) * 512ULL);
     memset(buffer, 0, bytes);
 
     if (!sdcardAcquire(5000)) {
-        ++hd->readErrorCount;
         hd->lastIoError = EBUSY;
         recordFirstFailure(hd, 1, lba, bytes, 0, -1, 0, 0, EBUSY);
-        printf("HD: read storage lock timeout LBA=%u bytes=%u\n", lba,
+        MACPLUS_LOG("HD: read storage lock timeout LBA=%u bytes=%u\n", lba,
                static_cast<unsigned int>(bytes));
         return false;
     }
@@ -991,7 +1159,7 @@ static bool readSdImage(HdPriv *hd, unsigned int lba, uint8_t *buffer,
         if (hd->fp == nullptr && !reopenSdImage(hd)) {
             recordFirstFailure(hd, 2, lba, bytes, 0, -1, 0, 0,
                                static_cast<int>(hd->lastIoError));
-            printf("HD: read reopen %d/3 failed, errno=%lu\n", attempt,
+            MACPLUS_LOG("HD: read reopen %d/3 failed, errno=%lu\n", attempt,
                    static_cast<unsigned long>(hd->lastIoError));
             continue;
         }
@@ -1016,17 +1184,12 @@ static bool readSdImage(HdPriv *hd, unsigned int lba, uint8_t *buffer,
                 if (errno != 0) savedErrno = errno;
                 if (transferred != want || ferror(hd->fp) != 0) break;
             }
-        } else {
-            ++hd->seekErrorCount;
         }
         const int streamError = ferror(hd->fp);
-        hd->lastReadPrefix = firstFourBytes(buffer, count);
 
         if (seekResult == 0 && count == bytes && streamError == 0) {
             hd->lastIoError = 0;
             hd->lastFileOffset = offset + static_cast<long>(count);
-            hdReadIOMicros +=
-                (uint32_t)(esp_timer_get_time() - ioStartUs);
             sdcardRelease();
             return true;
         }
@@ -1035,21 +1198,17 @@ static bool readSdImage(HdPriv *hd, unsigned int lba, uint8_t *buffer,
                                           : static_cast<uint32_t>(EIO);
         recordFirstFailure(hd, 3, lba, bytes, count, seekResult, 0,
                            streamError, savedErrno);
-        printf("HD: read retry %d/3 LBA=%u bytes=%u seek=%d read=%u ferror=%d errno=%d prefix=%08lX\n",
+        MACPLUS_LOG("HD: read retry %d/3 LBA=%u bytes=%u seek=%d read=%u ferror=%d errno=%d\n",
                attempt, lba, static_cast<unsigned int>(bytes), seekResult,
-               static_cast<unsigned int>(count), streamError, savedErrno,
-               static_cast<unsigned long>(hd->lastReadPrefix));
+               static_cast<unsigned int>(count), streamError, savedErrno);
 
         // FatFS latches FIL.err after FR_DISK_ERR. Reopening is required;
         // clearerr() only resets the newlib FILE wrapper.
         reopenSdImage(hd);
     }
 
-    ++hd->readErrorCount;
-    hdReadIOMicros += (uint32_t)(esp_timer_get_time() - ioStartUs);
     markStorageOffline(hd, hd->lastIoError);
     memset(buffer, 0, bytes);
-    hd->lastReadPrefix = 0;
     sdcardRelease();
     return false;
 }
@@ -1059,10 +1218,9 @@ static bool writeSdRange(HdPriv *hd, unsigned int lba, const uint8_t *buffer,
     const long offset = static_cast<long>(static_cast<uint64_t>(lba) * 512ULL);
 
     if (!sdcardAcquire(5000)) {
-        ++hd->writeErrorCount;
         hd->lastIoError = EBUSY;
         recordFirstFailure(hd, 4, lba, bytes, 0, -1, 0, 0, EBUSY);
-        printf("HD: write storage lock timeout LBA=%u bytes=%u\n", lba,
+        MACPLUS_LOG("HD: write storage lock timeout LBA=%u bytes=%u\n", lba,
                static_cast<unsigned int>(bytes));
         return false;
     }
@@ -1071,7 +1229,7 @@ static bool writeSdRange(HdPriv *hd, unsigned int lba, const uint8_t *buffer,
         if (hd->fp == nullptr && !reopenSdImage(hd)) {
             recordFirstFailure(hd, 5, lba, bytes, 0, -1, 0, 0,
                                static_cast<int>(hd->lastIoError));
-            printf("HD: write reopen %d/3 failed, errno=%lu\n", attempt,
+            MACPLUS_LOG("HD: write reopen %d/3 failed, errno=%lu\n", attempt,
                    static_cast<unsigned long>(hd->lastIoError));
             continue;
         }
@@ -1099,8 +1257,6 @@ static bool writeSdRange(HdPriv *hd, unsigned int lba, const uint8_t *buffer,
             }
             if (flushStream) flushResult = fflush(hd->fp);
             if (errno != 0) savedErrno = errno;
-        } else {
-            ++hd->seekErrorCount;
         }
         const int streamError = ferror(hd->fp);
 
@@ -1116,7 +1272,7 @@ static bool writeSdRange(HdPriv *hd, unsigned int lba, const uint8_t *buffer,
                                           : static_cast<uint32_t>(EIO);
         recordFirstFailure(hd, 6, lba, bytes, count, seekResult, flushResult,
                            streamError, savedErrno);
-        printf("HD: write retry %d/3 LBA=%u bytes=%u seek=%d wrote=%u flush=%d ferror=%d errno=%d\n",
+        MACPLUS_LOG("HD: write retry %d/3 LBA=%u bytes=%u seek=%d wrote=%u flush=%d ferror=%d errno=%d\n",
                attempt, lba, static_cast<unsigned int>(bytes), seekResult,
                static_cast<unsigned int>(count), flushResult, streamError,
                savedErrno);
@@ -1243,7 +1399,6 @@ static bool flushCache(HdPriv *hd) {
     if (!ok) {
         // Avoid retrying a failed card transaction on every emulator frame.
         hd->lastFlushMs = millis();
-        ++hd->writeErrorCount;
         return false;
     }
 
@@ -1316,7 +1471,6 @@ static bool readImageCached(HdPriv *hd, unsigned int lba, uint8_t *buffer,
     // are pending so a just-written sector is still visible.
     if (hd->flashData != nullptr && hd->dirtyBlocks == 0 && bytes >= 512) {
         memcpy(buffer, hd->flashData + static_cast<size_t>(lba) * 512U, bytes);
-        hd->lastReadPrefix = firstFourBytes(buffer, bytes);
         return true;
     }
 
@@ -1339,7 +1493,6 @@ static bool readImageCached(HdPriv *hd, unsigned int lba, uint8_t *buffer,
         currentLba += count / 512U;
         remaining -= count;
     }
-    hd->lastReadPrefix = firstFourBytes(buffer, bytes);
     return true;
 }
 
@@ -1480,11 +1633,6 @@ static int hdScsiCmd(SCSITransferData *data, unsigned int cmd,
     int ret = 0;
     HdPriv *hd = (HdPriv *)arg;
 
-    hd->lastCommand = cmd;
-    hd->lastLba = lba;
-    hd->lastLength = len;
-    ++hd->commandCount;
-
     bool commandOk = true;
 
     switch (cmd) {
@@ -1520,21 +1668,19 @@ static int hdScsiCmd(SCSITransferData *data, unsigned int cmd,
                 memset(data->data, 0, data->dataCapacity);
             }
         } else if (!bufferOk || !exportedRangeIsValid(hd, lba, bytes)) {
-            ++hd->readErrorCount;
             hd->lastIoError = EINVAL;
             commandOk = false;
             setSense(hd, 0x05, 0x21, 0x00); // ILLEGAL REQUEST, LBA out of range
             if (data->data != nullptr && data->dataCapacity != 0) {
                 memset(data->data, 0, data->dataCapacity);
             }
-            printf("HD: invalid read LBA=%u sectors=%u bytes=%u capacity=%u image=%d\n",
+            MACPLUS_LOG("HD: invalid read LBA=%u sectors=%u bytes=%u capacity=%u image=%d\n",
                    lba, len, static_cast<unsigned int>(bytes),
                    static_cast<unsigned int>(data->dataCapacity), hd->size);
         } else if (hd->flashData != nullptr && lockHd(hd)) {
             commandOk = readExportedImage(hd, lba, data->data, bytes);
             unlockHd(hd);
             if (!commandOk) {
-                ++hd->readErrorCount;
                 setSense(hd, 0x03, 0x11, 0x00);
                 memset(data->data, 0, bytes);
             }
@@ -1542,14 +1688,12 @@ static int hdScsiCmd(SCSITransferData *data, unsigned int cmd,
             commandOk = false;
             setSense(hd, 0x02, 0x3A, 0x00);
         }
-        if (commandOk) hd->readSectors += len;
         ret = commandOk ? static_cast<int>(bytes) : 0;
         break;
     }
 
     case 0x0A: // WRITE(6)
     case 0x2A: { // WRITE(10)
-        const unsigned int sectors = len;
         const size_t bytes = static_cast<size_t>(len) * 512U;
         const bool bufferOk = data->data != nullptr &&
                               bytes <= data->dataCapacity;
@@ -1557,18 +1701,16 @@ static int hdScsiCmd(SCSITransferData *data, unsigned int cmd,
             commandOk = false;
             setSense(hd, 0x02, 0x3A, 0x00); // medium not present
         } else if (!bufferOk || !exportedRangeIsValid(hd, lba, bytes)) {
-            ++hd->writeErrorCount;
             hd->lastIoError = EINVAL;
             commandOk = false;
             setSense(hd, 0x05, 0x21, 0x00);
-            printf("HD: invalid write LBA=%u sectors=%u bytes=%u capacity=%u image=%d\n",
+            MACPLUS_LOG("HD: invalid write LBA=%u sectors=%u bytes=%u capacity=%u image=%d\n",
                    lba, len, static_cast<unsigned int>(bytes),
                    static_cast<unsigned int>(data->dataCapacity), hd->size);
         } else if (hd->flashData != nullptr && lockHd(hd)) {
             commandOk = writeExportedBaseImage(hd, lba, data->data, bytes);
             unlockHd(hd);
             if (!commandOk) {
-                ++hd->writeErrorCount;
                 setSense(hd, 0x03, 0x0C, 0x02);
             }
         } else {
@@ -1576,7 +1718,6 @@ static int hdScsiCmd(SCSITransferData *data, unsigned int cmd,
             setSense(hd, 0x02, 0x3A, 0x00);
         }
         if (commandOk) {
-            hd->writeSectors += sectors;
             ret = static_cast<int>(bytes);
         }
         break;
@@ -1593,7 +1734,7 @@ static int hdScsiCmd(SCSITransferData *data, unsigned int cmd,
     }
 
     case 0x12: { // INQUIRY
-        printf("HD: Inquiry\n");
+        MACPLUS_LOG("HD: Inquiry\n");
         ret = copyData(data, inq_resp, sizeof(inq_resp), len);
         break;
     }
@@ -1627,16 +1768,15 @@ static int hdScsiCmd(SCSITransferData *data, unsigned int cmd,
         data->data[6] = 2; // 512-byte sectors
         data->data[7] = 0;
         ret = 8;
-        printf("HD: Read capacity (%lu sectors)\n",
+        MACPLUS_LOG("HD: Read capacity (%lu sectors)\n",
                static_cast<unsigned long>(lastLba + 1));
         break;
     }
 
     default:
-        ++hd->unrecognizedCommandCount;
         commandOk = false;
         setSense(hd, 0x05, 0x20, 0x00); // ILLEGAL REQUEST, invalid command
-        printf("********** hdScsiCmd: unrecognized command %x\n", cmd);
+        MACPLUS_LOG("********** hdScsiCmd: unrecognized command %x\n", cmd);
         break;
     }
 
@@ -1653,7 +1793,7 @@ SCSIDevice *hdCreate(void) {
     if (ret == nullptr) ret = (SCSIDevice*)malloc(sizeof(SCSIDevice));
     if (hd == nullptr) hd = (HdPriv*)malloc(sizeof(HdPriv));
     if (ret == nullptr || hd == nullptr) {
-        printf("HD: allocation failed (free heap=%d, largest=%d)\n",
+        MACPLUS_LOG("HD: allocation failed (free heap=%d, largest=%d)\n",
                (int)esp_get_free_heap_size(),
                (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         free(ret);
@@ -1667,8 +1807,22 @@ SCSIDevice *hdCreate(void) {
     hd->primary = activeHd == nullptr;
     hd->lastFlushMs = millis();
 
-    // Try SD card first (check multiple filenames)
-    if (sdcardMounted()) {
+    // The protected Flash image is the normal runtime backend.  Check it
+    // before opening /sd/hd.img so the emulator task does not enter the
+    // deepest FatFS/stat/fopen path during startup.  SD remains the fallback
+    // used to create or repair the cache.
+    bool rawFlashReady = false;
+    RawFlashMetadata cachedMetadata = {};
+    if (readRawFlashMetadata(&cachedMetadata) &&
+        rawImageBytesIsValid(cachedMetadata.imageBytes) &&
+        !rawFlashJournalHasPending() &&
+        hdRawFlashImageIsValid(cachedMetadata.imageBytes)) {
+        hd->size = static_cast<int>(cachedMetadata.imageBytes);
+        rawFlashReady = prepareRawFlashHd(hd);
+    }
+
+    // Try SD card only when the Flash cache is absent, invalid, or damaged.
+    if (!rawFlashReady && sdcardMounted()) {
         if (sdcardAcquire(5000)) {
             const char *names[] = { "/sd/hd.img", "/sd/hd.hd",
                                     "/sd/hd.dsk", NULL };
@@ -1681,7 +1835,7 @@ SCSIDevice *hdCreate(void) {
                 if (!sizeOk) {
                     hd->lastIoError = statOk ? EINVAL :
                         (errno != 0 ? static_cast<uint32_t>(errno) : ENOENT);
-                    printf("HD: cannot stat %s or invalid size=%ld errno=%lu\n",
+                    MACPLUS_LOG("HD: cannot stat %s or invalid size=%ld errno=%lu\n",
                            names[i], statOk ? static_cast<long>(fileInfo.st_size) : 0L,
                            static_cast<unsigned long>(hd->lastIoError));
                     continue;
@@ -1691,7 +1845,7 @@ SCSIDevice *hdCreate(void) {
                 if (hd->fp) {
                     setvbuf(hd->fp, nullptr, _IONBF, 0);
                     if (!macImageHeaderIsValid(hd->fp, static_cast<long>(fileInfo.st_size))) {
-                        printf("HD: refusing %s; Apple Driver Map/HFS header is invalid\n",
+                        MACPLUS_LOG("HD: refusing %s; Apple Driver Map/HFS header is invalid\n",
                                names[i]);
                         fclose(hd->fp);
                         hd->fp = nullptr;
@@ -1702,7 +1856,7 @@ SCSIDevice *hdCreate(void) {
                     strlcpy(hd->path, names[i], sizeof(hd->path));
                     hd->usingSd = true;
                     hd->ready = true;
-                    printf("HD: Using SD card %s (%d bytes, read/write; stat)\n",
+                    MACPLUS_LOG("HD: Using SD card %s (%d bytes, read/write; stat)\n",
                            names[i], hd->size);
                 } else {
                     const int openError = errno != 0 ? errno : EIO;
@@ -1725,11 +1879,11 @@ SCSIDevice *hdCreate(void) {
                         hd->usingSd = true;
                         hd->readOnly = true;
                         hd->ready = true;
-                        printf("HD: Using SD card %s (%d bytes, read-only; r+b errno=%d; stat)\n",
+                        MACPLUS_LOG("HD: Using SD card %s (%d bytes, read-only; r+b errno=%d; stat)\n",
                                names[i], hd->size, openError);
                     }
                     if (!hd->fp) {
-                        printf("HD: cannot open %s r+b, errno=%d; rb=%s\n",
+                        MACPLUS_LOG("HD: cannot open %s r+b, errno=%d; rb=%s\n",
                                names[i], openError,
                                readOnlyAvailable ? "ok" : "failed");
                     }
@@ -1737,14 +1891,14 @@ SCSIDevice *hdCreate(void) {
             }
             sdcardRelease();
         } else {
-            printf("HD: SD storage lock timeout while opening image\n");
+            MACPLUS_LOG("HD: SD storage lock timeout while opening image\n");
         }
     }
 
     // Prefer the protected Flash cache: copy /sd/hd.img there on first boot,
     // then serve all reads from the memory-mapped copy. SD is never used for
     // runtime random reads.
-    const bool rawFlashReady = prepareRawFlashHd(hd);
+    if (!rawFlashReady) rawFlashReady = prepareRawFlashHd(hd);
     if (rawFlashReady) {
         if (hd->fp != nullptr) {
             fclose(hd->fp);
@@ -1754,7 +1908,7 @@ SCSIDevice *hdCreate(void) {
         hd->usingSd = false;
         hd->readOnly = false;
         hd->ready = true;
-        printf("HD: Using raw flash image at 0x%X (%d bytes, read/write)\n",
+        MACPLUS_LOG("HD: Using raw flash image at 0x%X (%d bytes, read/write)\n",
                static_cast<unsigned int>(hdCacheBase), hd->size);
     } else if (hd->fp != nullptr) {
         fclose(hd->fp);
@@ -1763,25 +1917,34 @@ SCSIDevice *hdCreate(void) {
         hd->usingSd = false;
         hd->ready = false;
         hd->size = 0;
-        printf("HD: Flash cache unavailable; SD random I/O disabled\n");
+        MACPLUS_LOG("HD: Flash cache unavailable; SD random I/O disabled\n");
     }
 
     if (!hd->fp && hd->flashData == nullptr) {
         hd->ready = false;
         hd->size = 0;
         hd->lastIoError = EIO;
-        printf("HD: hard disk unavailable; only the named '%s' partition is allowed\n",
+        MACPLUS_LOG("HD: hard disk unavailable; only the named '%s' partition is allowed\n",
                MACPLUS_DATA_PARTITION_LABEL);
     }
 
-    if (hd->ready) prepareInstallVolume();
+    if (hd->ready && prepareInstallVolume()) {
+        // Do the first 8 KiB cache fill before the 68K reset.  Without this
+        // warm-up the first IWM revolution performs an SD seek/read directly
+        // from the emulation core and produces a visible frame-time spike.
+        if (!hdReadInstallSector(0, installWarmupSector)) {
+            MACPLUS_LOG("INSTALL: initial cache warm-up failed\n");
+        } else {
+            MACPLUS_LOG("INSTALL: initial track cache warm\n");
+        }
+    }
 
     if (activeHd == nullptr) {
         activeHd = hd;
     }
 
     if (hd->primary && hd->mutex == nullptr) {
-        printf("HD: mutex unavailable; async flush disabled\n");
+        MACPLUS_LOG("HD: mutex unavailable; async flush disabled\n");
     } else if (hd->primary && flushTaskHandle == nullptr) {
         // Flash/FatFS calls can use more than the usual 8KB task stack on
         // this target. If the larger stack cannot be allocated, leave the
@@ -1790,9 +1953,9 @@ SCSIDevice *hdCreate(void) {
             hdFlushTask, "hd-flush", 4096, hd, 1, &flushTaskHandle, 1);
         if (flushTaskResult != pdPASS) {
             flushTaskHandle = nullptr;
-            printf("HD: async flush task unavailable; using emulator fallback\n");
+            MACPLUS_LOG("HD: async flush task unavailable; using emulator fallback\n");
         } else {
-            printf("HD: async flush task enabled, interval=%lums, cache=%uKiB\n",
+            MACPLUS_LOG("HD: async flush task enabled, interval=%lums, cache=%uKiB\n",
                    static_cast<unsigned long>(HD_FLUSH_INTERVAL_MS),
                    static_cast<unsigned int>(HD_CACHE_BLOCK_COUNT *
                                              HD_CACHE_BLOCK_BYTES / 1024));

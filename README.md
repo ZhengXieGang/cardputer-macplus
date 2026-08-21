@@ -32,6 +32,12 @@ Launcher 版和 Full 版功能相同，区别只在 Flash 布局。Launcher 版�
 3. 上传软件盘，设备写入完成后自动重启。
 4. 在 Finder 打开软盘图标，把应用复制到系统硬盘。
 
+Wi-Fi 传输模式下，设备屏幕自带维护菜单，不需要打开网页修改设置：
+
+- `;` / `.`：上移 / 下移；`,` / `/`：减小 / 增大当前数值。
+- `Enter` 或 G0：执行当前项；可调鼠标满倾斜速度（默认 320 px/s）和音量，也可清除 Flash 中的 `hd.img` 缓存或删除 SD 卡软件盘。
+- 网页客户端只负责上传系统盘和软件盘镜像。
+
 长按任意键或 G0 两秒退出 Wi-Fi 模式。
 
 ## 操作
@@ -48,6 +54,13 @@ Launcher 版和 Full 版功能相同，区别只在 Flash 布局。Launcher 版�
 ```bash
 ~/.platformio/penv/bin/pio run -e cardputer-adv-launcher
 ~/.platformio/penv/bin/pio run -e cardputer-adv-full
+```
+
+普通构建默认关闭串口诊断日志，以减少 Flash 占用和运行时开销。需要排障记录时使用独立的 debug 环境：
+
+```bash
+~/.platformio/penv/bin/pio run -e cardputer-adv-launcher-debug
+~/.platformio/penv/bin/pio run -e cardputer-adv-full-debug
 ```
 
 `tools/generate_partitions.py` 会在构建前生成 Launcher/Full 构建布局。Launcher 版需要合并 bootloader、分区描述和应用后交给 Launcher 安装；不要把合并包直接写入 Launcher 应用槽，也不要使用 `pio run -t upload`。

@@ -7,8 +7,6 @@
  * ----------------------------------------------------------------------------
  */
 #include "mouse.h"
-#include <stdio.h>
-#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 
@@ -22,7 +20,6 @@ static const int quad[4]={0x0, 0x1, 0x3, 0x2};
 
 Mouse mouse;
 static portMUX_TYPE mouseMux = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t mouseTickCount;
 
 #define MAXCDX 640
 
@@ -43,7 +40,6 @@ void mouseMove(int dx, int dy, int btn) {
 int mouseTick() {
 	int ret=0;
 	portENTER_CRITICAL(&mouseMux);
-	mouseTickCount++;
 	if (mouse.dx>0) {
 		mouse.dx--;
 		mouse.rpx--;
@@ -65,19 +61,4 @@ int mouseTick() {
 	ret|=mouse.btn<<4;
 	portEXIT_CRITICAL(&mouseMux);
 	return ret;
-}
-
-void mouseDebugPrint(void) {
-	int dx, dy, rpx, rpy, btn;
-	uint32_t ticks;
-	portENTER_CRITICAL(&mouseMux);
-	dx=mouse.dx;
-	dy=mouse.dy;
-	rpx=mouse.rpx&3;
-	rpy=mouse.rpy&3;
-	btn=mouse.btn;
-	ticks=mouseTickCount;
-	portEXIT_CRITICAL(&mouseMux);
-	printf("MOUSEHW: pending=%d,%d phase=%d,%d btn=%d ticks=%lu\n",
-		dx, dy, rpx, rpy, btn, (unsigned long)ticks);
 }

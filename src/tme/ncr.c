@@ -1,9 +1,10 @@
+#include "debug_log.h"
 /*
  * ----------------------------------------------------------------------------
  * "THE BEER-WARE LICENSE" (Revision 42):
- * Jeroen Domburg <jeroen@spritesmods.com> wrote this file. As long as you retain 
- * this notice you can do whatever you want with this stuff. If we meet some day, 
- * and you think this stuff is worth it, you can buy me a beer in return. 
+ * Jeroen Domburg <jeroen@spritesmods.com> wrote this file. As long as you retain
+ * this notice you can do whatever you want with this stuff. If we meet some day,
+ * and you think this stuff is worth it, you can buy me a beer in return.
  * ----------------------------------------------------------------------------
  */
 #include <stdint.h>
@@ -129,11 +130,11 @@ void ncrInit(void) {
 	if (ncr.data.data != NULL) {
 		ncr.data.dataCapacity = SCSI_DATA_BUFFER_BYTES;
 		memset(ncr.data.data, 0, ncr.data.dataCapacity);
-		printf("SCSI: data buffer=%u bytes at %p\n",
+		MACPLUS_LOG("SCSI: data buffer=%u bytes at %p\n",
 		       (unsigned int)ncr.data.dataCapacity, ncr.data.data);
 	} else {
 		ncr.data.dataCapacity = 0;
-		printf("SCSI: data buffer allocation failed\n");
+		MACPLUS_LOG("SCSI: data buffer allocation failed\n");
 	}
 }
 
@@ -160,19 +161,19 @@ static void parseScsiCmd(int isRead) {
 		len=buf[4];
 		if (len==0) len=256;
 		ctrl=buf[5];
-//		for (int x=0; x<6; x++) printf("%02X ", buf[x]);
-//		printf("\n");
+//		for (int x=0; x<6; x++) MACPLUS_LOG("%02X ", buf[x]);
+//		MACPLUS_LOG("\n");
 	} else if (group==1 || group==2) { //10-byte command
 		lba=buf[5]|(buf[4]<<8)|(buf[3]<<16)|(buf[2]<<24);
 		len=buf[8]|(buf[7]<<8);
 		ctrl=buf[9];
-//		for (int x=0; x<10; x++) printf("%02X ", buf[x]);
-//		printf("\n");
+//		for (int x=0; x<10; x++) MACPLUS_LOG("%02X ", buf[x]);
+//		MACPLUS_LOG("\n");
 	} else {
-		printf("SCSI: UNSUPPORTED CMD %x\n", cmd);
+		MACPLUS_LOG("SCSI: UNSUPPORTED CMD %x\n", cmd);
 		return;
 	}
-//	printf("SCSI: CMD %x LBA %x LEN %x CTRL %x %s\n", cmd, lba, len, ctrl, isRead?"*READ*":"*WRITE*");
+//	MACPLUS_LOG("SCSI: CMD %x LBA %x LEN %x CTRL %x %s\n", cmd, lba, len, ctrl, isRead?"*READ*":"*WRITE*");
 	if (ncr.dev[ncr.selected]) {
 		// Large reads are split into dataCapacity-sized chunks.  The Mac
 		// keeps draining the data-in phase; ncrRefillReadChunk() is called
@@ -291,12 +292,12 @@ unsigned int ncrRead(unsigned int addr, unsigned int dack) {
 			if (ncr.bufpos < ncr.datalen && ncr.bufpos < ncr.bufmax) {
 				ncr.din=ncr.buf[ncr.bufpos++];
 			}
-//			printf("Send next byte dma %d/%d\n", ncr.bufpos, ncr.datalen);
+//			MACPLUS_LOG("Send next byte dma %d/%d\n", ncr.bufpos, ncr.datalen);
 		}
 	}
 	if (addr==0) {
 		ret=ncr.din;
-//		printf("READ BYTE %02X dack=%d\n", ret, dack);
+//		MACPLUS_LOG("READ BYTE %02X dack=%d\n", ret, dack);
 	} else if (addr==1) {
 		// /rst s s /ack /bsy /sel /atn databus
 		ret=ncr.inicmd;
@@ -333,15 +334,15 @@ unsigned int ncrRead(unsigned int addr, unsigned int dack) {
 			if (ncr.bufpos >= ncr.datalen) ncrRefillReadChunk();
 			ret|=BSR_DMARQ;
 			if (ncr.bufpos>=ncr.datalen) {
-//				printf("End of DMA reached: bufpos %d datalen %d\n", ncr.bufpos, ncr.datalen);
+//				MACPLUS_LOG("End of DMA reached: bufpos %d datalen %d\n", ncr.bufpos, ncr.datalen);
 				ret|=BSR_EODMA;
 			}
 		}
 	} else if (addr==6) {
 		ret=ncr.din;
-//		printf("READ BYTE (NCR addr6) %02X dack=%d\n", ret, dack);
+//		MACPLUS_LOG("READ BYTE (NCR addr6) %02X dack=%d\n", ret, dack);
 	}
-//	printf("%08X SCSI: (dack %d), cur st %s read %s (reg %d) = %x \n", 
+//	MACPLUS_LOG("%08X SCSI: (dack %d), cur st %s read %s (reg %d) = %x \n",
 //		pc, dack,  stateNames[ncr.state], regNamesR[addr], addr, ret);
 	return ret;
 }
@@ -366,7 +367,7 @@ void ncrWrite(unsigned int addr, unsigned int dack, unsigned int val) {
 			if (ncr.dout==0x90) ncr.selected=4;
 			if (ncr.dout==0xA0) ncr.selected=5;
 			if (ncr.dout==0xC0) ncr.selected=6;
-//			printf("Selected dev: %d (val %x)\n", ncr.selected, ncr.dout);
+//			MACPLUS_LOG("Selected dev: %d (val %x)\n", ncr.selected, ncr.dout);
 		}
 		if (((val&INI_BSY)==0) && ncr.state==ST_SELECT) {
 			ncr.state=ST_SELDONE;
@@ -389,7 +390,7 @@ void ncrWrite(unsigned int addr, unsigned int dack, unsigned int val) {
 				if (ncr.bufpos < ncr.datalen && ncr.bufpos < ncr.bufmax) {
 					ncr.din=ncr.buf[ncr.bufpos++];
 				}
-//				printf("Send byte non-dma\n");
+//				MACPLUS_LOG("Send byte non-dma\n");
 			}
 		}
 		if (val&INI_RST) {
@@ -424,22 +425,22 @@ void ncrWrite(unsigned int addr, unsigned int dack, unsigned int val) {
 				prepareDataOutPhase();
 			}
 			if ((ncr.tcr&0x7)==TCR_IO) {
-//				printf("Data Out finished: Host read %d/%d bytes.\n", ncr.bufpos, ncr.datalen);
+//				MACPLUS_LOG("Data Out finished: Host read %d/%d bytes.\n", ncr.bufpos, ncr.datalen);
 			}
 			ncr.bufpos=0;
 			ncr.dmaActive=0;
 			int type=val&(TCR_MSG|TCR_CD);
 			if (type==0) {
-//				printf("Sel data buf %s.\n", (newtcr&TCR_IO)?"IN":"OUT");
+//				MACPLUS_LOG("Sel data buf %s.\n", (newtcr&TCR_IO)?"IN":"OUT");
 				ncr.buf=ncr.data.data;
 				ncr.bufmax=(int)ncr.data.dataCapacity;
 			} else if (type==TCR_CD) {
-//				printf("Sel cmd/status buf %s.\n", (newtcr&TCR_IO)?"IN":"OUT");
+//				MACPLUS_LOG("Sel cmd/status buf %s.\n", (newtcr&TCR_IO)?"IN":"OUT");
 				ncr.buf=ncr.data.cmd;
 				ncr.bufmax=sizeof(ncr.data.cmd);
 				ncr.datalen=1;
 			} else if (type==(TCR_CD|TCR_MSG)) {
-//				printf("Sel msg buf %s.\n", (newtcr&TCR_IO)?"IN":"OUT");
+//				MACPLUS_LOG("Sel msg buf %s.\n", (newtcr&TCR_IO)?"IN":"OUT");
 				ncr.buf=ncr.data.msg;
 				ncr.bufmax=sizeof(ncr.data.msg);
 				ncr.datalen=1;
@@ -459,7 +460,7 @@ void ncrWrite(unsigned int addr, unsigned int dack, unsigned int val) {
 		// Start DMA initiator receive (target -> initiator).
 		ncr.dmaActive=1;
 	}
-//	printf("%08X SCSI: (dack %d), cur state %s %02x to %s (reg %d)\n", pc, dack, stateNames[ncr.state], val, regNamesW[addr], addr);
+//	MACPLUS_LOG("%08X SCSI: (dack %d), cur state %s %02x to %s (reg %d)\n", pc, dack, stateNames[ncr.state], val, regNamesW[addr], addr);
 }
 
 void ncrRegisterDevice(int id, SCSIDevice* dev){

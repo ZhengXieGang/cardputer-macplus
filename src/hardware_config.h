@@ -17,9 +17,13 @@
 #define SD_SPI_CLK_PIN 40
 #define SD_SPI_MISO_PIN 39
 #define SD_SPI_CS_PIN 12
-#define SD_SPI_FREQ_HZ (20 * 1000 * 1000)
-#define SD_SPI_TRANSFER_BYTES (8 * 1024)
+#define SD_SPI_FREQ_HZ (25 * 1000 * 1000)
 #define SD_SPI_PROBE_FREQ_HZ (400 * 1000)
+// Allow FatFS read-ahead requests to use a multi-sector DMA transaction.  The
+// install-disk cache reads 8 KiB windows; limiting the SDSPI host to 512 bytes
+// turns every window into sixteen command/transaction pairs and makes random
+// Finder scans stall the emulator.
+#define SD_SPI_TRANSFER_BYTES (4 * 1024)
 
 // GO button (G0) acts as the Mac mouse button.  GPIO0 is also the boot strap
 // pin; holding it during reset enters download mode, which is normal.

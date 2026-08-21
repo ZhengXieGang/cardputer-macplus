@@ -7,4 +7,3 @@
 
 void mouseMove(int dx, int dy, int btn);
 int mouseTick();
-void mouseDebugPrint(void);

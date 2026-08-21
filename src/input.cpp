@@ -1,3 +1,4 @@
+#include "debug_log.h"
 /*
  * Cardputer-Adv input for the Mac Plus emulator.
  *
@@ -83,14 +84,10 @@ uint32_t lastKeyboardPollMs = 0;
 uint32_t lastImuPollMs = 0;
 bool webComboActive = false;
 bool webComboTriggered = false;
-uint32_t mousePollCount = 0;
-uint32_t mouseMoveCount = 0;
-uint32_t lastMouseDt = 0;
 uint8_t physicalMacScan[4][14];
 bool fnDown = false;
 bool tcaReady = false;
 uint8_t pendingKeyPress = kNoKey;
-uint32_t tcaEventCount = 0;
 uint32_t tcaReadFailures = 0;
 uint32_t tcaLastInitMs = 0;
 
@@ -136,7 +133,7 @@ static bool forceBmi270PowerOn() {
     const bool writeOk =
         M5.In_I2C.writeRegister8(BMI270_ADDR, BMI270_PWR_CTRL_REG,
                                  BMI270_PWR_CTRL_ACC_GYR, 400000);
-    printf("IMU: BMI270 chipid=0x%02X pwrctrl_write=%d\n", chipId, writeOk ? 1 : 0);
+    MACPLUS_LOG("IMU: BMI270 chipid=0x%02X pwrctrl_write=%d\n", chipId, writeOk ? 1 : 0);
     return chipId == 0x24 && writeOk;
 }
 
@@ -147,7 +144,7 @@ static bool reinitImu() {
     const uint32_t now = millis();
     if (now - imuLastReinitMs < 1000) return false;
     imuLastReinitMs = now;
-    printf("IMU: %lu consecutive read failures, reinitializing...\n",
+    MACPLUS_LOG("IMU: %lu consecutive read failures, reinitializing...\n",
            static_cast<unsigned long>(imuReadFailCount));
     bool ok = false;
     for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
@@ -158,7 +155,7 @@ static bool reinitImu() {
     delay(5);
     float ax = 0, ay = 0, az = 0;
     const bool readable = ok && readBmi270Accel(&ax, &ay, &az);
-    printf("IMU: reinit %s (enabled=%d readable=%d accel=%.2f,%.2f,%.2f)\n",
+    MACPLUS_LOG("IMU: reinit %s (enabled=%d readable=%d accel=%.2f,%.2f,%.2f)\n",
            readable ? "OK" : "FAILED",
            M5.Imu.isEnabled() ? 1 : 0, readable ? 1 : 0, ax, ay, az);
     return readable;
@@ -222,7 +219,7 @@ static bool initTca8418() {
     tcaReady = ok;
     tcaLastInitMs = millis();
     if (!ok) ++tcaReadFailures;
-    printf("KEYBOARD: TCA8418 %s (direct FIFO)\n", ok ? "ready" : "unavailable");
+    MACPLUS_LOG("KEYBOARD: TCA8418 %s (direct FIFO)\n", ok ? "ready" : "unavailable");
     return ok;
 }
 
@@ -301,7 +298,6 @@ static void pollKeyboard(bool routeToMac) {
         }
         if (event != 0) {
             handleTcaEvent(event, routeToMac);
-            ++tcaEventCount;
         }
     }
     if (eventCount != 0) tcaWrite8(TCA8418_INT_STAT, 0x09);
@@ -329,8 +325,6 @@ void pollMouse() {
     const uint32_t now = millis();
     const uint32_t dt = now - lastMouseTick;
     lastMouseTick = now;
-    lastMouseDt = dt;
-    ++mousePollCount;
     if (dt == 0 || dt > 100) {
         mouseAccX = 0.0f;
         mouseAccY = 0.0f;
@@ -408,10 +402,12 @@ void pollMouse() {
     const float targetY = ny * velocity;
     imuVelocityX += (targetX - imuVelocityX) * IMU_VELOCITY_ALPHA;
     imuVelocityY += (targetY - imuVelocityY) * IMU_VELOCITY_ALPHA;
-    // imuSensitivity is the cursor speed (px/s) at full tilt. dt is in
-    // milliseconds; fractional pixels accumulate for smooth low-speed motion.
-    mouseAccX += imuVelocityX * imuSensitivity * dt / 1000.0f;
-    mouseAccY += imuVelocityY * imuSensitivity * dt / 1000.0f;
+    // Scale the entire joystick response, not just a separately clamped
+    // endpoint. Fractional pixels accumulate for smooth low-speed motion.
+    const float cursorSpeed = IMU_BASE_CURSOR_SPEED *
+        static_cast<float>(imuPointerSpeedPercent) / 100.0f;
+    mouseAccX += imuVelocityX * cursorSpeed * dt / 1000.0f;
+    mouseAccY += imuVelocityY * cursorSpeed * dt / 1000.0f;
     if (mouseAccX > 200.0f) mouseAccX = 200.0f;
     if (mouseAccX < -200.0f) mouseAccX = -200.0f;
     if (mouseAccY > 200.0f) mouseAccY = 200.0f;
@@ -423,7 +419,6 @@ void pollMouse() {
     dx = constrain(dx, -IMU_MAX_DELTA, IMU_MAX_DELTA);
     dy = constrain(dy, -IMU_MAX_DELTA, IMU_MAX_DELTA);
     if (dx != 0 || dy != 0) {
-        ++mouseMoveCount;
         mouseMove(dx, dy, mouseButton ? 1 : 0);
     }
 }
@@ -446,8 +441,7 @@ void pollButton() {
 
 } // namespace
 
-// Runtime-tunable IMU sensitivity (serial command "sens <value>").
-float imuSensitivity = IMU_SENSITIVITY;
+uint16_t imuPointerSpeedPercent = IMU_POINTER_SPEED_DEFAULT_PERCENT;
 int imuFlipX = -1;
 int imuFlipY = 1;
 int imuSwapXY = 0;
@@ -479,7 +473,6 @@ void cardputerInputInit() {
     fnDown = false;
     pendingKeyPress = kNoKey;
     tcaReady = false;
-    tcaEventCount = 0;
     tcaReadFailures = 0;
     tcaLastInitMs = 0;
     const uint32_t now = millis();
@@ -493,14 +486,14 @@ void cardputerInputInit() {
     bool accOk = false;
     for (int attempt = 0; attempt < 4 && !accOk; ++attempt) {
         if (attempt > 0) {
-            printf("IMU: init retry %d...\n", attempt);
+            MACPLUS_LOG("IMU: init retry %d...\n", attempt);
             M5.Imu.begin(&M5.In_I2C, M5.getBoard());
             forceBmi270PowerOn();
             delay(20);
         }
         accOk = M5.Imu.isEnabled() && readBmi270Accel(&ax, &ay, &az);
     }
-    printf("INPUT: IMU enabled=%d accel=%d (%.2f,%.2f,%.2f) g\n",
+    MACPLUS_LOG("INPUT: IMU enabled=%d accel=%d (%.2f,%.2f,%.2f) g\n",
            M5.Imu.isEnabled() ? 1 : 0, accOk ? 1 : 0, ax, ay, az);
 }
 
@@ -530,43 +523,4 @@ uint8_t cardputerInputReadKeyPress() {
     const uint8_t key = pendingKeyPress;
     pendingKeyPress = kNoKey;
     return key;
-}
-
-void cardputerInputImuStatus() {
-    float ax = 0, ay = 0, az = 0;
-    const bool ok = readBmi270Accel(&ax, &ay, &az);
-    printf("IMU: enabled=%d read=%d accel=(%.3f,%.3f,%.3f) g fail=%lu last_reinit_ms=%lu\n",
-           M5.Imu.isEnabled() ? 1 : 0, ok ? 1 : 0, ax, ay, az,
-           static_cast<unsigned long>(imuReadFailCount),
-           static_cast<unsigned long>(imuLastReinitMs));
-}
-
-void cardputerInputMouseStatus() {
-    float ax = 0, ay = 0, az = 0;
-    const bool ok = readBmi270Accel(&ax, &ay, &az);
-    printf("MOUSE: polls=%lu moves=%lu dt=%lu active=%d acc=%.3f,%.3f,%.3f "
-           "sm=%.3f,%.3f,%.3f vel=%.3f,%.3f accXY=%.2f,%.2f "
-           "cursor=%u,%u read=%d\n",
-           static_cast<unsigned long>(mousePollCount),
-           static_cast<unsigned long>(mouseMoveCount),
-           static_cast<unsigned long>(lastMouseDt),
-           imuMoveActive ? 1 : 0,
-           ax, ay, az, accSmX, accSmY, accSmZ, imuVelocityX, imuVelocityY,
-           mouseAccX, mouseAccY,
-           (unsigned)tmeGetMouseX(), (unsigned)tmeGetMouseY(), ok ? 1 : 0);
-}
-
-void cardputerInputKeysStatus() {
-    uint8_t intStatus = 0;
-    uint8_t eventCount = 0;
-    const bool statusOk = tcaRead8(TCA8418_INT_STAT, &intStatus);
-    const bool countOk = tcaRead8(TCA8418_KEY_LCK_EC, &eventCount);
-    printf("KEYS: tca=%d i2c=%d/%d int=0x%02X fifo=%u events=%lu "
-           "ctrl=%d opt=%d alt=%d shift=%d fn=%d\n",
-           tcaReady ? 1 : 0, statusOk ? 1 : 0, countOk ? 1 : 0,
-           intStatus, eventCount & 0x0F,
-           static_cast<unsigned long>(tcaEventCount),
-           keysDown[kMacCmd] ? 1 : 0, keysDown[kMacOption] ? 1 : 0,
-           keysDown[kMacCtrl] ? 1 : 0, keysDown[kMacShift] ? 1 : 0,
-           fnDown ? 1 : 0);
 }

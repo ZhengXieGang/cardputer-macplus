@@ -1,3 +1,4 @@
+#include "debug_log.h"
 /*
  * Display driver for the Cardputer-Adv port of the Mac Plus emulator.
  *
@@ -73,10 +74,7 @@ static CropFrame cropFrame = {};
 static portMUX_TYPE displayStateMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile int viewX = 0;
 static volatile int viewY = 0;
-static volatile uint32_t dispFrames = 0;
-static volatile uint32_t dispRequests = 0;
-static volatile uint32_t dispDropped = 0;
-static volatile uint32_t dispAliveTicks = 0;
+static volatile bool hasFrame = false;
 static int lastViewX = 0;
 static int lastViewY = 0;
 static const lgfx::bgr888_t monoPalette[2] = {
@@ -107,17 +105,6 @@ static void printConsoleLine(int y, uint16_t color, const char *prefix,
     // whole panel. The terminal lines fit within this padding at font size 1.
     M5.Display.print("                                        ");
 }
-
-uint32_t dispGetFrameCount(void) { return dispFrames; }
-uint32_t dispGetRequestCount(void) { return dispRequests; }
-uint32_t dispGetAliveTicks(void) { return dispAliveTicks; }
-uint32_t dispGetDroppedFrameCount(void) { return dispDropped; }
-uint32_t dispGetDirtyFrameCount(void) { return 0; }
-uint32_t dispGetFullFrameCount(void) { return dispFrames; }
-uint32_t dispGetLastDirtyArea(void) { return 0; }
-uint32_t dispGetLastRenderUs(void) { return 0; }
-uint32_t dispGetLastAcquireUs(void) { return 0; }
-uint32_t dispGetLastPresentUs(void) { return 0; }
 
 // Copy VIEW_W bits starting at bit srcBit of srcRow into a byte-aligned
 // crop row (MSB-first, same layout as the Mac framebuffer).
@@ -185,21 +172,26 @@ static void renderFrame(const CropFrame &frame) {
 
 void dispService() {
     if (displayBuffers == nullptr) return;
-    ++dispAliveTicks;
     if (!takePendingFrame()) return;
     renderFrame(cropFrame);
-    ++dispFrames;
     releaseFrame();
 }
 
 void dispInit() {
-    printf("DISP: native %dx%d, panel %dx%d, view %dx%d @%dx, pan follows mouse\n",
+    MACPLUS_LOG("DISP: native %dx%d, panel %dx%d, view %dx%d @%dx, pan follows mouse\n",
            MAC_FB_W, MAC_FB_H, CARD_DISP_W, CARD_DISP_H, VIEW_W, VIEW_H,
            VIEW_SCALE);
     if (displayBuffers == nullptr) {
+        // The crop shadow is sent to the panel by DMA.  Allocate it while the
+        // heap is still compact and prefer DMA-capable 8-bit RAM; the old
+        // EXEC-only request could fail after the emulator reserved its RAM.
         displayBuffers = static_cast<uint8_t *>(heap_caps_malloc(
             DISPLAY_BUFFER_BYTES,
-            MALLOC_CAP_EXEC | MALLOC_CAP_8BIT));
+            MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+        if (displayBuffers == nullptr) {
+            displayBuffers = static_cast<uint8_t *>(heap_caps_malloc(
+                DISPLAY_BUFFER_BYTES, MALLOC_CAP_8BIT));
+        }
         if (displayBuffers == nullptr) {
             displayBuffers = static_cast<uint8_t *>(malloc(DISPLAY_BUFFER_BYTES));
         }
@@ -210,7 +202,7 @@ void dispInit() {
             cropFrame.state = CropFrameState::Free;
         }
     }
-    printf("DISP: dynamic buffers %u bytes at %p\n",
+    MACPLUS_LOG("DISP: dynamic buffers %u bytes at %p\n",
            static_cast<unsigned int>(DISPLAY_BUFFER_BYTES), displayBuffers);
     M5.Display.fillScreen(COLOR_BLACK);
     if (displayBuffers == nullptr) return;
@@ -218,11 +210,11 @@ void dispInit() {
     if (panel != nullptr && panel->getBus() != nullptr) {
         const uint32_t oldClock = panel->getBus()->getClock();
         panel->getBus()->setClock(PANEL_SPI_HZ);
-        printf("DISP: SPI clock %lu -> %lu Hz\n",
+        MACPLUS_LOG("DISP: SPI clock %lu -> %lu Hz\n",
                static_cast<unsigned long>(oldClock),
                static_cast<unsigned long>(panel->getBus()->getClock()));
     }
-    printf("DISP: control-task service ready (free heap=%d)\n",
+    MACPLUS_LOG("DISP: control-task service ready (free heap=%d)\n",
            (int)esp_get_free_heap_size());
     consoleMode = ConsoleMode::None;
     consoleMessageLines = 0;
@@ -268,13 +260,12 @@ void dispDraw(uint8_t *mem) {
     }
     portEXIT_CRITICAL(&displayStateMux);
     if (!writable) {
-        ++dispDropped;
         return;
     }
 
     // Assemble the visible crop, diff it against the previous snapshot and
     // mark only changed panel strips as dirty.
-    const bool firstFrame = dispRequests == 0;
+    const bool firstFrame = !hasFrame;
     const bool viewMoved = firstFrame || viewX != lastViewX || viewY != lastViewY;
     lastViewX = viewX;
     lastViewY = viewY;
@@ -299,7 +290,7 @@ void dispDraw(uint8_t *mem) {
     portENTER_CRITICAL(&displayStateMux);
     cropFrame.dirtyMask = dirty;
     cropFrame.state = CropFrameState::Pending;
-    ++dispRequests;
+    hasFrame = true;
     portEXIT_CRITICAL(&displayStateMux);
 }
 

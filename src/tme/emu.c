@@ -1,3 +1,4 @@
+#include "debug_log.h"
 /*
  * ----------------------------------------------------------------------------
  * "THE BEER-WARE LICENSE" (Revision 42):
@@ -11,13 +12,10 @@
 #pragma GCC optimize("O2")
 #endif
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <stdint.h>
-#include <errno.h>
 #include "emu.h"
-#include <string.h>
 #include "tmeconfig.h"
 #include "m68k.h"
 #include "disp.h"
@@ -26,15 +24,10 @@
 #include "scc.h"
 #include "rtc.h"
 #include "ncr.h"
-#include <stdio.h>
-#include <string.h>
 #include "hd.h"
+#include "softfloppy.h"
 #include "snd.h"
 #include "mouse.h"
-#include "sdcard.h"
-#include <stdbool.h>
-#include <sys/time.h>
-#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_rom_sys.h"
@@ -47,9 +40,6 @@
 #define EMU_FRAME_US_REMAINDER (1000000 % EMU_FRAME_RATE)
 #define MOUSE_STEP_CYCLES 8000
 
-static volatile uint32_t emuCyclesPerSecond = 0;
-static volatile uint32_t emuWallFps = 0;
-static volatile uint32_t emuWallSpeedPercent = 0;
 static volatile uint32_t emuProgramCounter = 0;
 static volatile int emuRunning = 0;
 static int viaIrqRequested = 0;
@@ -59,9 +49,6 @@ uint8_t tmeGetScsiDeviceMask(void) { return ncrGetDeviceMask(); }
 extern unsigned char *macRam;
 extern uint8_t *macFb[];
 
-uint32_t tmeGetCyclesPerSecond(void) { return emuCyclesPerSecond; }
-uint32_t tmeGetWallFps(void) { return emuWallFps; }
-uint32_t tmeGetWallSpeedPercent(void) { return emuWallSpeedPercent; }
 uint32_t tmeGetProgramCounter(void) { return emuProgramCounter; }
 int tmeIsRunning(void) { return emuRunning; }
 
@@ -107,7 +94,7 @@ typedef uint8_t (*PeripAccessCb)(unsigned int address, int data, int isWrite);
 
 uint8_t unhandledAccessCb(unsigned int address, int data, int isWrite) {
 	unsigned int pc=m68k_get_reg(NULL, M68K_REG_PC);
-	printf("Unhandled %s @ 0x%X! PC=0x%X\n", isWrite?"write":"read", address, pc);
+	MACPLUS_LOG("Unhandled %s @ 0x%X! PC=0x%X\n", isWrite?"write":"read", address, pc);
 	return 0xff;
 }
 
@@ -135,6 +122,13 @@ uint8_t sscAccessCb(unsigned int address, int data, int isWrite) {
 }
 
 uint8_t iwmAccessCb(unsigned int address, int data, int isWrite) {
+	// The replacement .Sony ROM driver calls this paravirtual address for
+	// normal 400K/800K block I/O.  Handle it before the physical IWM state
+	// machine so no register phase or timing state is disturbed.
+	if (isWrite && address == 0x00C00069U) {
+		softFloppyPvHook((uint8_t)data);
+		return 0;
+	}
 	// The Mac Plus IWM is wired only to the odd byte lane. A 16-bit CPU
 	// access must therefore not let its even byte consume an IWM register.
 	if ((address & 1U) == 0) return 0;
@@ -265,7 +259,7 @@ static void ramInit() {
 		macRam=(unsigned char*)malloc(TME_RAMSIZE);
 	}
 	assert(macRam);
-	printf("Mac RAM allocated at %p (%d bytes)\n", macRam, TME_RAMSIZE);
+	MACPLUS_LOG("Mac RAM allocated at %p (%d bytes)\n", macRam, TME_RAMSIZE);
 
 	// Screen framebuffer at the top of RAM, exactly like a real Mac Plus:
 	// 0x3FA700 in the 4MB view wraps onto TME_SCREENBUF in the 256KB buffer.
@@ -273,7 +267,7 @@ static void ramInit() {
 	macFb[1]=macFb[0];
 	macSnd[0]=&macRam[TME_SNDBUF];
 	macSnd[1]=&macRam[TME_SNDBUF_ALT];
-	printf("Clearing ram...\n");
+	MACPLUS_LOG("Clearing ram...\n");
 	for (int x=0; x<TME_RAMSIZE; x++) macRam[x]=rand();
 }
 
@@ -363,7 +357,7 @@ void m68k_pc_changed_handler_function(unsigned int address) {
 		 * report both values while diagnosing invalid control-flow targets. */
 		const unsigned int d2=m68k_get_reg(NULL, M68K_REG_D2);
 		const unsigned int tableOffset=(0x400U+(d2&0xffffU))&(TME_RAMSIZE-1);
-		printf("PC not in mem! addr=0x%08X pc=0x%08X sr=0x%04X "
+		MACPLUS_LOG("PC not in mem! addr=0x%08X pc=0x%08X sr=0x%04X "
 		       "ppc=0x%08X ir=0x%04X d0=0x%08X d2=0x%08X "
 		       "a0=0x%08X a2=0x%08X a5=0x%08X sp=0x%08X "
 		       "rom_remap=%d map=%u\n",
@@ -381,12 +375,12 @@ void m68k_pc_changed_handler_function(unsigned int address) {
 		       rom_remap,
 		       address / MEMMAP_ES);
 		if (macRam != NULL) {
-			printf("LOWMEM: table+0x%04X=%02X%02X%02X%02X base=%02X%02X%02X%02X\n",
+			MACPLUS_LOG("LOWMEM: table+0x%04X=%02X%02X%02X%02X base=%02X%02X%02X%02X\n",
 			       d2&0xffffU,
 			       macRam[tableOffset], macRam[(tableOffset+1)&(TME_RAMSIZE-1)],
 			       macRam[(tableOffset+2)&(TME_RAMSIZE-1)], macRam[(tableOffset+3)&(TME_RAMSIZE-1)],
 			       macRam[0x400], macRam[0x401], macRam[0x402], macRam[0x403]);
-			printf("BOOTPTR: b2a=%02X%02X%02X%02X b4c=%02X%02X%02X%02X\n",
+			MACPLUS_LOG("BOOTPTR: b2a=%02X%02X%02X%02X b4c=%02X%02X%02X%02X\n",
 				macRam[0xB2A], macRam[0xB2B], macRam[0xB2C], macRam[0xB2D],
 				macRam[0xB4C], macRam[0xB4D], macRam[0xB4E], macRam[0xB4F]);
 		}
@@ -396,70 +390,37 @@ void m68k_pc_changed_handler_function(unsigned int address) {
 }
 
 
-void printFps(int logOutput) {
-	struct timeval tv;
-	static struct timeval oldtv;
-	gettimeofday(&tv, NULL);
-	if (oldtv.tv_sec!=0) {
-		long msec=(tv.tv_sec-oldtv.tv_sec)*1000;
-		msec+=(tv.tv_usec-oldtv.tv_usec)/1000;
-		if (msec > 0) {
-			emuWallFps = (uint32_t)((60000ULL + (uint64_t)msec / 2) /
-							(uint64_t)msec);
-			emuWallSpeedPercent =
-				(uint32_t)((100000ULL + (uint64_t)msec / 2) /
-							(uint64_t)msec);
-				if (logOutput) {
-					printf("Speed: %lu%% (%lu fps)\n",
-					       (unsigned long)emuWallSpeedPercent,
-					       (unsigned long)emuWallFps);
-				}
-		}
-	}
-	oldtv.tv_sec=tv.tv_sec;
-	oldtv.tv_usec=tv.tv_usec;
-}
-
 void tmeStartEmu(void *rom) {
 	int ca1=0, ca2=0;
 	int x, frame=0;
-	int cyclesPerSec=0;
 	int yieldDivider=0;
-	int statsSeconds=0;
 	int frameUsRemainder=0;
 	int mouseCycles=0;
-	int installInsertFrames=0;
 	macRom=(unsigned char*)rom;
 	ramInit();
 	rom_remap=1;
 	regenMemmap(1);
-	printf("Display init before storage...\n");
-	dispInit();
-	printf("Creating HD and registering it...\n");
+	// Display buffers and the control task are initialized once during board
+	// setup, before the large emulator allocations.  Calling dispInit() here a
+	// second time leaks another set of buffers/task state and leaves too little
+	// heap for SCC initialization, which causes an immediate abort/boot loop.
+	MACPLUS_LOG("Creating HD and registering it...\n");
 	ncrInit();
 	SCSIDevice *hd=hdCreate();
 	ncrRegisterDevice(6, hd);
-	iwmInit();
-	const uint32_t installDiskBytes = hdGetInstallVolumeBytes();
-	if (installDiskBytes != 0) {
-		// Keep the uploaded disk out of the boot drive scan.  System 3 polls
-		// the Sony drive after Finder is up and will then mount the change.
-		installInsertFrames = 600; // ten seconds at 60 Hz
-		printf("INSTALL: delaying IWM insert (%lu bytes)\n",
-		       (unsigned long)installDiskBytes);
-	}
+	softFloppyInit();
 	viaClear(VIA_PORTA, 0x7F);
 	viaSet(VIA_PORTA, 0x80);
 	viaClear(VIA_PORTA, 0xFF);
 	viaSet(VIA_PORTB, (1<<3));
 	sccInit();
-	printf("Initializing m68k...\n");
+	MACPLUS_LOG("Initializing m68k...\n");
 	m68k_pc_changed_handler_function(0x0);
 	m68k_init();
-	printf("Setting CPU type and resetting...");
+	MACPLUS_LOG("Setting CPU type and resetting...");
 	m68k_set_cpu_type(M68K_CPU_TYPE_68000);
 	m68k_pulse_reset();
-	printf("Done! Running.\n");
+	MACPLUS_LOG("Done! Running.\n");
 	emuRunning=1;
 	int64_t nextFrameUs=esp_timer_get_time();
 	while(1) {
@@ -495,7 +456,6 @@ void tmeStartEmu(void *rom) {
 			}
 
 		}
-		cyclesPerSec+=x;
 			emuProgramCounter=m68k_get_reg(NULL, M68K_REG_PC);
 			dispDraw(macFb[0]);
 			sndPush(macSnd[audio_remap?1:0], audio_en?audio_volume:0);
@@ -513,13 +473,8 @@ void tmeStartEmu(void *rom) {
 			frameUsRemainder=0;
 		}
 		frame++;
-		if (installInsertFrames > 0 && --installInsertFrames == 0) {
-			iwmSetDiskReader(hdReadInstallSector, installDiskBytes, 1);
-			printf("INSTALL: IWM disk inserted (%luKB %s)\n",
-			       (unsigned long)(installDiskBytes / 1024U),
-			       hdIsInstallVolumeMfs() ? "MFS" : "HFS");
-		}
-		ca1^=1;
+		softFloppyFrameTick();
+			ca1^=1;
 		viaControlWrite(VIA_CA1, ca1);
 		if (frame==59) {
 			ca2^=1;
@@ -530,12 +485,6 @@ void tmeStartEmu(void *rom) {
 			viaControlWrite(VIA_CA2, ca2);
 				rtcTick();
 				frame=0;
-				statsSeconds++;
-				const int logOutput=(statsSeconds%5)==0;
-				printFps(logOutput);
-			if (logOutput) printf("%d Hz\n", cyclesPerSec);
-			emuCyclesPerSecond=cyclesPerSec;
-			cyclesPerSec=0;
 		}
 	}
 }

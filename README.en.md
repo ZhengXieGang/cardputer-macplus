@@ -50,6 +50,13 @@ Requires PlatformIO, Arduino-ESP32, and M5Cardputer:
 ~/.platformio/penv/bin/pio run -e cardputer-adv-full
 ```
 
+Normal builds compile out serial diagnostics to reduce Flash use and runtime overhead. Use the separate debug environments when a serial trace is needed:
+
+```bash
+~/.platformio/penv/bin/pio run -e cardputer-adv-launcher-debug
+~/.platformio/penv/bin/pio run -e cardputer-adv-full-debug
+```
+
 `tools/generate_partitions.py` creates the Launcher/Full build layouts. The Launcher edition must be merged with its bootloader and partition description before Launcher installs it. Do not write the merged package directly into a Launcher app slot, and do not run `pio run -t upload`.
 
 ## References

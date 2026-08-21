@@ -1,3 +1,4 @@
+#include "debug_log.h"
 /*
  * ----------------------------------------------------------------------------
  * "THE BEER-WARE LICENSE" (Revision 42):
@@ -43,15 +44,15 @@ int rtcCom(int en, int dat, int clk) {
 				//First 8 bits, or all 16 bits if write: accumulate data
 				if (dat) rtc.cmd|=(1<<(15-rtc.pos));
 			}
-//			printf("RTC: clocktick %d, dataline %d, cmd %x\n", rtc.pos, dat, rtc.cmd);
+//			MACPLUS_LOG("RTC: clocktick %d, dataline %d, cmd %x\n", rtc.pos, dat, rtc.cmd);
 			if (rtc.cmd&0x8000) { //read
 				if (rtc.pos==8) {
 					rtc.cmd|=rtc.mem[(rtc.cmd&0x7C00)>>10];
-//					printf("RTC: Read cmd %x val %x\n", rtc.cmd>>8, (rtc.cmd&0xff));
+//					MACPLUS_LOG("RTC: Read cmd %x val %x\n", rtc.cmd>>8, (rtc.cmd&0xff));
 				}
 				ret=((rtc.cmd&(1<<(15-rtc.pos)))?1:0);
 			} else if (rtc.pos==15) {
-//				printf("RTC: Write cmd %x\n", rtc.cmd>>8);
+//				MACPLUS_LOG("RTC: Write cmd %x\n", rtc.cmd>>8);
 				rtc.mem[(rtc.cmd&0x7C00)>>10]=rtc.cmd&0xff;
 				saveRtcMem((char*)rtc.mem);
 			}

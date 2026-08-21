@@ -1,3 +1,4 @@
+#include "debug_log.h"
 #include <M5Cardputer.h>
 
 #include <stdint.h>
@@ -11,12 +12,16 @@ namespace {
 
 constexpr size_t kSamplesPerFrame = 370;
 constexpr uint32_t kSampleRate = 22200;
-constexpr uint8_t kSpeakerVolume = 38; // 60% lower than the original default
+// M5Unified's master volume is an 8-bit value (0..255).  90 is approximately
+// 35% of full scale and is applied after begin(), when the board codec/I2S
+// configuration is finalized.
+constexpr uint8_t kSpeakerVolume = 90;
 constexpr uint8_t kAudioChannel = 0;
 
 uint8_t audioBuffers[3][kSamplesPerFrame];
 size_t nextBuffer = 0;
 bool speakerReady = false;
+uint8_t speakerVolume = kSpeakerVolume;
 
 }  // namespace
 
@@ -33,11 +38,21 @@ void sndInit() {
     config.task_priority = 1;
     config.task_pinned_core = 1;
     M5.Speaker.config(config);
-    M5.Speaker.setVolume(kSpeakerVolume);
     speakerReady = M5.Speaker.begin();
-    printf("AUDIO: Cardputer speaker %s (%lu Hz, 8-bit mono)\n",
+    if (speakerReady) M5.Speaker.setVolume(speakerVolume);
+    MACPLUS_LOG("AUDIO: Cardputer speaker %s (%lu Hz, volume=%u, 8-bit mono)\n",
            speakerReady ? "ready" : "unavailable",
-           static_cast<unsigned long>(kSampleRate));
+           static_cast<unsigned long>(kSampleRate),
+           static_cast<unsigned>(speakerVolume));
+}
+
+void sndSetVolume(uint8_t volume) {
+    speakerVolume = volume;
+    if (speakerReady) M5.Speaker.setVolume(volume);
+}
+
+uint8_t sndGetVolume(void) {
+    return speakerVolume;
 }
 
 int sndPush(uint8_t *data, int volume) {

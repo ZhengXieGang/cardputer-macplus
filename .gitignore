@@ -24,6 +24,8 @@ macplus.bin
 macplus-standalone.bin
 macplus-launcher.bin
 macplus-full.bin
+macplus-launcher-debug.bin
+macplus-full-debug.bin
 partitions.csv
 partitions-full.csv
 classic-apps/

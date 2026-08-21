@@ -8,4 +8,3 @@ void sccSetDcd(int chan, int val);
 void sccInit();
 void sccTick(int cycles);
 void sccRecv(int chan, uint8_t *data, int len, int delay);
-void sccDebugPrint(void);

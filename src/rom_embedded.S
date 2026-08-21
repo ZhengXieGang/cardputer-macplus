@@ -3,6 +3,7 @@
 // The firmware is self-contained so it can be installed by the M5 Launcher
 // (which does not preserve custom data partitions).  Regenerate the blob
 // with:  python3 tools/patch_rom.py <stock macplus.rom> roms/macplus-patched-256.rom
+// The blob is regenerated whenever the ROM driver patch changes.
     .section .rodata
     .align 4
     .global macplus_rom_embedded

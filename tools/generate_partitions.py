@@ -6,7 +6,7 @@ Import("env")
 
 PROJECT_DIR = Path(env.subst("$PROJECT_DIR"))
 PIO_ENV = str(env.get("PIOENV", "")).lower()
-IS_FULL = PIO_ENV.endswith("-full")
+IS_FULL = PIO_ENV.endswith("-full") or PIO_ENV.endswith("-full-debug")
 OUTPUT = PROJECT_DIR / ".pio" / "generated" / (
     "partitions-full.csv" if IS_FULL else "partitions-launcher.csv"
 )
@@ -58,7 +58,9 @@ def package_firmware(source, target, env):
     if not IS_FULL:
         place(image, 0x1A0000, b"MACPLUS-DATA-V1\n")
 
-    output_name = "macplus-full.bin" if IS_FULL else "macplus-launcher.bin"
+    package_kind = "full" if IS_FULL else "launcher"
+    debug_suffix = "-debug" if "debug" in PIO_ENV else ""
+    output_name = "macplus-{}{}.bin".format(package_kind, debug_suffix)
     output_path = PROJECT_DIR / output_name
     output_path.write_bytes(image)
     print("Packaged firmware: {} ({} bytes)".format(output_path, len(image)))

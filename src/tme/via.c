@@ -1,3 +1,4 @@
+#include "debug_log.h"
 /*
  * ----------------------------------------------------------------------------
  * "THE BEER-WARE LICENSE" (Revision 42):
@@ -111,7 +112,7 @@ static void viaCheckIrq() {
 	if (mint) {
 		via.ifr|=IFR_IRQ;
 		viaIrq(1);
-//		printf("VIA: Raised IRQ because masked if is %x\n", mint);
+//		MACPLUS_LOG("VIA: Raised IRQ because masked if is %x\n", mint);
 	} else if (!mint) {
 		if (via.ifr&IFR_IRQ) viaIrq(0);
 		via.ifr&=~IFR_IRQ;
@@ -263,7 +264,7 @@ void viaWrite(unsigned int addr, unsigned int val) {
 		}
 		via.ier&=0x7f;
 		if (via.ier&0x18) {
-			printf("Unsupported int enabled. ier=%x\n", via.ier);
+			MACPLUS_LOG("Unsupported int enabled. ier=%x\n", via.ier);
 			abort();
 		}
 		viaCheckIrq();
@@ -272,7 +273,7 @@ void viaWrite(unsigned int addr, unsigned int val) {
 		viaCbPortAWrite(val);
 		via.ina=(via.ina&~via.ddra)|(val&via.ddra);
 	}
-//	printf("PC %x VIA write %s val %x\n", pc, viaRegNames[addr], val);
+//	MACPLUS_LOG("PC %x VIA write %s val %x\n", pc, viaRegNames[addr], val);
 }
 
 
@@ -335,7 +336,7 @@ unsigned int viaRead(unsigned int addr) {
 		//ORA
 		val=via.ina;
 	}
-//	printf("PC %x VIA read %s val %x\n", pc, viaRegNames[addr], val);
+//	MACPLUS_LOG("PC %x VIA read %s val %x\n", pc, viaRegNames[addr], val);
 	return val;
 }
 
@@ -344,7 +345,7 @@ void viaDebugPrint(void) {
 	portENTER_CRITICAL(&kbdQueueMux);
 	queued = (kbdQueueHead - kbdQueueTail + KBD_QUEUE_SIZE) % KBD_QUEUE_SIZE;
 	portEXIT_CRITICAL(&kbdQueueMux);
-	printf("VIAHW: inb=0x%02X ddrb=0x%02X outb=0x%02X ifr=0x%02X "
+	MACPLUS_LOG("VIAHW: inb=0x%02X ddrb=0x%02X outb=0x%02X ifr=0x%02X "
 		"ier=0x%02X kbd=q%d push=%lu pop=%lu drop=%lu cmd=0x%02X rsp=0x%02X\n",
 		via.inb, via.ddrb, via.outb, via.ifr, via.ier, queued,
 		(unsigned long)kbdPushCount, (unsigned long)kbdPopCount,

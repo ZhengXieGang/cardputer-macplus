@@ -1,3 +1,4 @@
+#include "debug_log.h"
 #include "partition_setup.h"
 
 #include <Arduino.h>
@@ -82,7 +83,7 @@ bool inspectTable(uint8_t *table, TableInfo &info) {
     if (esp_partition_table_verify(
             reinterpret_cast<const esp_partition_info_t *>(table), true,
             &verifiedEntries) != ESP_OK) {
-        printf("STORAGE: current partition table verification failed\n");
+        MACPLUS_LOG("STORAGE: current partition table verification failed\n");
         return false;
     }
 
@@ -145,7 +146,7 @@ void showError(const char *reason, const char *action) {
         action,
     };
     dispShowMessage(lines, 3);
-    printf("STORAGE: %s; %s\n", reason, action);
+    MACPLUS_LOG("STORAGE: %s; %s\n", reason, action);
 }
 
 bool waitForConfirmation(const char *operation, uint32_t imageBytes,
@@ -201,7 +202,7 @@ bool verifyGeneratedTable(uint8_t *table, size_t expectedEntries) {
 bool writeTable(const uint8_t *table) {
     if (esp_flash_default_chip == nullptr ||
         esp_flash_default_chip->os_func == nullptr) {
-        printf("STORAGE: flash OS functions unavailable\n");
+        MACPLUS_LOG("STORAGE: flash OS functions unavailable\n");
         return false;
     }
 
@@ -223,7 +224,7 @@ bool writeTable(const uint8_t *table) {
         esp_err_t error = esp_flash_erase_region(
             nullptr, ESP_PARTITION_TABLE_OFFSET, kTableSectorBytes);
         if (error != ESP_OK) {
-            printf("STORAGE: table erase %d/3 failed: %s\n", attempt + 1,
+            MACPLUS_LOG("STORAGE: table erase %d/3 failed: %s\n", attempt + 1,
                    esp_err_to_name(error));
             continue;
         }
@@ -231,7 +232,7 @@ bool writeTable(const uint8_t *table) {
         error = esp_flash_write(nullptr, table, ESP_PARTITION_TABLE_OFFSET,
                                 kTableSectorBytes);
         if (error != ESP_OK) {
-            printf("STORAGE: table write %d/3 failed: %s\n", attempt + 1,
+            MACPLUS_LOG("STORAGE: table write %d/3 failed: %s\n", attempt + 1,
                    esp_err_to_name(error));
             continue;
         }
@@ -241,11 +242,11 @@ bool writeTable(const uint8_t *table) {
         const bool matches = error == ESP_OK &&
                              memcmp(verify, table, kTableSectorBytes) == 0;
         if (matches) {
-            printf("STORAGE: partition table write verified\n");
+            MACPLUS_LOG("STORAGE: partition table write verified\n");
             success = true;
             break;
         }
-        printf("STORAGE: table verify %d/3 failed: %s\n", attempt + 1,
+        MACPLUS_LOG("STORAGE: table verify %d/3 failed: %s\n", attempt + 1,
                error == ESP_OK ? "data mismatch" : esp_err_to_name(error));
     }
 
@@ -353,7 +354,7 @@ void macplusStorageSetup() {
         return;
     }
 
-    printf("STORAGE: %s request image=%lu old=%lu target=%lu offset=0x%lX "
+    MACPLUS_LOG("STORAGE: %s request image=%lu old=%lu target=%lu offset=0x%lX "
            "flash=%lu reserve=%lu\n",
            resize ? "resize" : "create",
            static_cast<unsigned long>(imageBytes),
@@ -417,11 +418,11 @@ void macplusStorageSetup() {
 
     const bool launcherLinked = registerLauncherDataPartition();
 
-    printf("STORAGE: %s '%s' at 0x%lX, %lu bytes\n",
+    MACPLUS_LOG("STORAGE: %s '%s' at 0x%lX, %lu bytes\n",
            resize ? "resized" : "created", MACPLUS_DATA_PARTITION_LABEL,
            static_cast<unsigned long>(partitionOffset),
            static_cast<unsigned long>(partitionBytes));
-    printf("STORAGE: Launcher data link %s\n",
+    MACPLUS_LOG("STORAGE: Launcher data link %s\n",
            launcherLinked ? "ready" : "unavailable");
     const char *done[] = {
         "MACPLUS STORAGE",

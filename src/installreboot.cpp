@@ -1,3 +1,4 @@
+#include "debug_log.h"
 #include <Arduino.h>
 #include "esp_attr.h"
 
@@ -28,7 +29,7 @@ extern "C" int webInstallModeRequested() {
 }
 
 extern "C" void requestWebInstallMode() {
-    printf("WEB: rebooting into integrated transfer mode\n");
+    MACPLUS_LOG("WEB: rebooting into integrated transfer mode\n");
     hdFlushNow();
     setWebMode(true);
     delay(100);
@@ -36,7 +37,7 @@ extern "C" void requestWebInstallMode() {
 }
 
 extern "C" void exitWebInstallMode() {
-    printf("WEB: leaving transfer mode\n");
+    MACPLUS_LOG("WEB: leaving transfer mode\n");
     setWebMode(false);
     delay(100);
     ESP.restart();

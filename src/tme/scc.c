@@ -1,9 +1,10 @@
+#include "debug_log.h"
 /*
  * ----------------------------------------------------------------------------
  * "THE BEER-WARE LICENSE" (Revision 42):
- * Jeroen Domburg <jeroen@spritesmods.com> wrote this file. As long as you retain 
- * this notice you can do whatever you want with this stuff. If we meet some day, 
- * and you think this stuff is worth it, you can buy me a beer in return. 
+ * Jeroen Domburg <jeroen@spritesmods.com> wrote this file. As long as you retain
+ * this notice you can do whatever you want with this stuff. If we meet some day,
+ * and you think this stuff is worth it, you can buy me a beer in return.
  * ----------------------------------------------------------------------------
  */
 #include <stdio.h>
@@ -23,7 +24,11 @@ Supports basic mouse pins plus hacked in LocalTalk
 //#define SCC_DBG
 
 
-#define exit_when_strict(er) exit(1)
+// A Mac driver may probe reserved SCC registers while processing mouse DCD
+// transitions.  A real Z8530 leaves those reads implementation-defined; it
+// does not reset the computer.  Keep unimplemented accesses benign on this
+// partial SCC model instead of terminating the emulator.
+#define exit_when_strict(...) ((void)0)
 
 void sccIrq(int ena);
 
@@ -69,12 +74,13 @@ typedef struct {
 	int wr2, wr9;
 } Scc;
 
-static Scc *sccState;
+// SCC state has a fixed size and lives for the entire emulator lifetime.
+// Keeping it in static storage avoids a late malloc failure when the
+// no-PSRAM Cardputer heap is fragmented by the display, SD and emulator
+// tasks during startup.
+static Scc sccStorage;
+static Scc *sccState = &sccStorage;
 #define scc (*sccState)
-static uint32_t dcdTransitions[2];
-static uint32_t extTriggers[2];
-static uint32_t extAcks[2];
-static int irqAsserted;
 
 
 /*
@@ -100,7 +106,7 @@ static void rxBufIgnoreRest(int chan) {
 	scc.chan[chan].rx[scc.chan[chan].rxBufCur].delay=-1;
 	scc.chan[chan].rxBufCur++;
 #ifdef SCC_DBG
-	printf("RxBuff: Skipping to next buff %d, which has delay %d.\n",
+	MACPLUS_LOG("RxBuff: Skipping to next buff %d, which has delay %d.\n",
 			scc.chan[chan].rxBufCur, scc.chan[chan].rx[scc.chan[chan].rxBufCur].delay);
 #endif
 	if (scc.chan[chan].rxBufCur>=NO_RXBUF) scc.chan[chan].rxBufCur=0;
@@ -111,7 +117,7 @@ static int rxByte(int chan, int *bytesLeftInBuf) {
 	int ret;
 	int curbuf=scc.chan[chan].rxBufCur;
 #ifdef SCC_DBG
-	printf("RxBuf: bufid %d byte %d/%d\n", curbuf, scc.chan[chan].rxPos, scc.chan[chan].rx[curbuf].len);
+	MACPLUS_LOG("RxBuf: bufid %d byte %d/%d\n", curbuf, scc.chan[chan].rxPos, scc.chan[chan].rx[curbuf].len);
 #endif
 	if (scc.chan[chan].rx[curbuf].delay!=0) return 0;
 	if (bytesLeftInBuf) *bytesLeftInBuf=scc.chan[chan].rx[curbuf].len-scc.chan[chan].rxPos-1;
@@ -133,7 +139,7 @@ static int rxBufTick(int chan, int noTicks) {
 		if (scc.chan[chan].rx[scc.chan[chan].rxBufCur].delay<=0) {
 			scc.chan[chan].rx[scc.chan[chan].rxBufCur].delay=0;
 #ifdef SCC_DBG
-			printf("Feeding buffer %d into SCC\n", scc.chan[chan].rxBufCur);
+			MACPLUS_LOG("Feeding buffer %d into SCC\n", scc.chan[chan].rxBufCur);
 #endif
 			return 1;
 		}
@@ -169,44 +175,44 @@ static int rxBufTick(int chan, int noTicks) {
 #define SCC_R0_BREAKABRT (1<<7)
 
 static void explainWrite(int reg, int chan, int val) {
-	const static char *cmdLo[]={"null", "point_high", "reset_ext_status_int", "send_ABORT", 
+	const static char *cmdLo[]={"null", "point_high", "reset_ext_status_int", "send_ABORT",
 			"ena_int_on_next_char", "reset_tx_pending", "error_reset", "reset_highest_ius"};
 	const static char *cmdHi[]={"null", "reset_rx_crc", "reset_tx_crc", "reset_tx_underrun_EOM_latch"};
 	const static char *intEna[]={"RxIntDisabled", "RxInt1stCharOrSpecial", "RxIntAllCharOrSpecial", "RxIntSpecial"};
 	const static char *rstDesc[]={"NoReset", "ResetChB", "ResetChA", "HwReset"};
 	if (reg==0) {
 		if (((val&0xF8)!=0) && ((val&0xF8)!=0x08)) {
-			printf("Write reg 0; CmdHi=%s CmdLo=%s\n", cmdHi[(val>>6)&3], cmdLo[(val>>3)&7]);
+			MACPLUS_LOG("Write reg 0; CmdHi=%s CmdLo=%s\n", cmdHi[(val>>6)&3], cmdLo[(val>>3)&7]);
 		}
 	} else if (reg==1) {
-		printf("Write reg 1 for chan %d: ", chan);
-		if (val&0x80) printf("WaitDmaReqEn ");
-		if (val&0x40) printf("WaitDmaReqFn ");
-		if (val&0x20) printf("WaitDmaOnRxTx ");
-		if (val&0x04) printf("ParityIsSpecial ");
-		if (val&0x02) printf("TxIntEna ");
-		if (val&0x01) printf("RxIntEna ");
-		printf("%s\n", intEna[(val>>3)&3]);
+		MACPLUS_LOG("Write reg 1 for chan %d: ", chan);
+		if (val&0x80) MACPLUS_LOG("WaitDmaReqEn ");
+		if (val&0x40) MACPLUS_LOG("WaitDmaReqFn ");
+		if (val&0x20) MACPLUS_LOG("WaitDmaOnRxTx ");
+		if (val&0x04) MACPLUS_LOG("ParityIsSpecial ");
+		if (val&0x02) MACPLUS_LOG("TxIntEna ");
+		if (val&0x01) MACPLUS_LOG("RxIntEna ");
+		MACPLUS_LOG("%s\n", intEna[(val>>3)&3]);
 	} else if (reg==9) {
-		printf("Write reg 9: cmd=%s ", rstDesc[(val>>6)&3]);
-		if (val&0x01) printf("VIS ");
-		if (val&0x02) printf("NV ");
-		if (val&0x04) printf("DLC ");
-		if (val&0x08) printf("MIE ");
-		if (val&0x10) printf("StatusHi ");
-		if (val&0x20) printf("RESVD ");
-		printf("\n");
+		MACPLUS_LOG("Write reg 9: cmd=%s ", rstDesc[(val>>6)&3]);
+		if (val&0x01) MACPLUS_LOG("VIS ");
+		if (val&0x02) MACPLUS_LOG("NV ");
+		if (val&0x04) MACPLUS_LOG("DLC ");
+		if (val&0x08) MACPLUS_LOG("MIE ");
+		if (val&0x10) MACPLUS_LOG("StatusHi ");
+		if (val&0x20) MACPLUS_LOG("RESVD ");
+		MACPLUS_LOG("\n");
 	} else if (reg==15) {
-		printf("Write reg 15: ");
-		if (val&0x02) printf("ZeroCountIE ");
-		if (val&0x08) printf("DcdIE ");
-		if (val&0x10) printf("SyncHuntIE ");
-		if (val&0x20) printf("CtsIE ");
-		if (val&0x40) printf("TxUnderrunIE ");
-		if (val&0x80) printf("BreakAbortIE ");
-		printf("\n");
+		MACPLUS_LOG("Write reg 15: ");
+		if (val&0x02) MACPLUS_LOG("ZeroCountIE ");
+		if (val&0x08) MACPLUS_LOG("DcdIE ");
+		if (val&0x10) MACPLUS_LOG("SyncHuntIE ");
+		if (val&0x20) MACPLUS_LOG("CtsIE ");
+		if (val&0x40) MACPLUS_LOG("TxUnderrunIE ");
+		if (val&0x80) MACPLUS_LOG("BreakAbortIE ");
+		MACPLUS_LOG("\n");
 	} else {
-		printf("Write chan %d reg %d val 0x%02X\n", chan, reg, val);
+		MACPLUS_LOG("Write chan %d reg %d val 0x%02X\n", chan, reg, val);
 	}
 }
 
@@ -216,21 +222,21 @@ void explainRead(int reg, int chan, int val) {
 			"ChATxBufEmpty", "ChAExtOrStatusChange", "ChARecvCharAvail", "ChASpecRecvCond",
 		};
 	if (reg==0) {
-		printf("Read chan %d reg 0:", chan);
-		if (val&0x01) printf("RxCharAvailable ");
-		if (val&0x02) printf("ZeroCount ");
-		if (val&0x04) printf("TxBufEmpty ");
-		if (val&0x08) printf("DCD ");
-		if (val&0x10) printf("SyncHunt ");
-		if (val&0x20) printf("CTS ");
-		if (val&0x40) printf("TxUnderrunEOM ");
-		if (val&0x80) printf("BreakAbort ");
-		printf("\n");
+		MACPLUS_LOG("Read chan %d reg 0:", chan);
+		if (val&0x01) MACPLUS_LOG("RxCharAvailable ");
+		if (val&0x02) MACPLUS_LOG("ZeroCount ");
+		if (val&0x04) MACPLUS_LOG("TxBufEmpty ");
+		if (val&0x08) MACPLUS_LOG("DCD ");
+		if (val&0x10) MACPLUS_LOG("SyncHunt ");
+		if (val&0x20) MACPLUS_LOG("CTS ");
+		if (val&0x40) MACPLUS_LOG("TxUnderrunEOM ");
+		if (val&0x80) MACPLUS_LOG("BreakAbort ");
+		MACPLUS_LOG("\n");
 	} else if (reg==2) {
-		printf("Read reg 2: ");
-		printf("IntRsn=%s\n", intRsn[(val>>1)&7]);
+		MACPLUS_LOG("Read reg 2: ");
+		MACPLUS_LOG("IntRsn=%s\n", intRsn[(val>>1)&7]);
 	} else {
-		printf("Read chan %d reg %d val 0x%X\n", chan, reg, val);
+		MACPLUS_LOG("Read chan %d reg %d val 0x%X\n", chan, reg, val);
 	}
 }
 
@@ -238,8 +244,7 @@ static void refreshIrqLine(void) {
 	const int active =
 		((scc.intpending&0x38) && (scc.chan[SCC_CHANA].wr1&1)) ||
 		((scc.intpending&0x07) && (scc.chan[SCC_CHANB].wr1&1));
-	irqAsserted=active?1:0;
-	sccIrq(irqAsserted);
+	sccIrq(active ? 1 : 0);
 }
 
 // Raises or clears the SCC IRQ line after pending state changes.
@@ -248,11 +253,11 @@ static void raiseInt(int chan) {
 	if ((scc.chan[chan].wr1&1) ){ //&& (scc.intpending&(~scc.intpendingOld))) {
 		scc.intpendingOld=scc.intpending;
 #ifdef SCC_DBG
-		printf("SCC int, pending %x: ", scc.intpending);
+		MACPLUS_LOG("SCC int, pending %x: ", scc.intpending);
 		for (int i=0; i<6; i++) {
-			if (scc.intpending&(1<<i)) printf("%s ", desc[i]);
+			if (scc.intpending&(1<<i)) MACPLUS_LOG("%s ", desc[i]);
 		}
-		printf("\n");
+		MACPLUS_LOG("\n");
 #endif
 	}
 	refreshIrqLine();
@@ -286,7 +291,6 @@ static void checkExtInt(int chan) {
 	if ((dif&SCC_R0_SYNCHUNT) && (wr15&SCC_WR15_SYNC)) triggered=1;
 	if ((dif&SCC_R0_EOM) && (wr15&SCC_WR15_TXU)) triggered=1;
 	if (triggered) {
-		extTriggers[chan]++;
 		if (chan==0 && ((scc.intpending&SCC_RR3_CHA_EXT)==0)) {
 			scc.chan[chan].rr0Latched=rr0;
 			scc.intpending|=SCC_RR3_CHA_EXT;
@@ -304,7 +308,6 @@ static void checkExtInt(int chan) {
 
 void sccSetDcd(int chan, int val) {
 	val=val?1:0;
-	if (scc.chan[chan].dcd!=val) dcdTransitions[chan]++;
 	scc.chan[chan].dcd=val;
 	checkExtInt(chan);
 }
@@ -323,11 +326,11 @@ void sccRecv(int chan, uint8_t *data, int len, int delay) {
 
 	//check if all buffers are full
 	if (scc.chan[chan].rx[bufid].delay!=-1) {
-		printf("Eek! Can't queue buffer: full!\n");
+		MACPLUS_LOG("Eek! Can't queue buffer: full!\n");
 		return;
 	}
 
-	printf("Serial transmit for chan %d queued; bufidx %d, len=%d delay=%d, %d other buffers in queue\n", chan, bufid, len, delay, n);
+	MACPLUS_LOG("Serial transmit for chan %d queued; bufidx %d, len=%d delay=%d, %d other buffers in queue\n", chan, bufid, len, delay, n);
 	memcpy(scc.chan[chan].rx[bufid].data, data, len);
 	scc.chan[chan].rx[bufid].data[len]=0xA5; //crc1
 	scc.chan[chan].rx[bufid].data[len+1]=0xA5; //crc2
@@ -346,7 +349,7 @@ static void checkRxIntPending(int chan) {
 	int doInt=0;
 	int rxIntMode=(scc.chan[chan].wr1>>3)&0x3;
 #ifdef SCC_DBG
-	printf("Int check: chan %d rx has byte %d, int mode %d, intOnNextRxChar: %d\n", 
+	MACPLUS_LOG("Int check: chan %d rx has byte %d, int mode %d, intOnNextRxChar: %d\n",
 			chan, rxHasByte(chan), rxIntMode, scc.chan[chan].intOnNextRxChar);
 #endif
 	if (scc.chan[chan].intOnNextRxChar && rxHasByte(chan)) {
@@ -356,7 +359,7 @@ static void checkRxIntPending(int chan) {
 	if (rxIntMode>=1) {
 		//special condition int... we handle only eof here
 		if (rxHasByte(chan) && scc.chan[chan].rxEom) doInt=1;
-	} 
+	}
 	if (rxIntMode==1) {
 		//int on 1st char
 		if (rxHasByte(chan) && scc.chan[chan].rxPos==0) doInt=1;
@@ -373,7 +376,7 @@ static void checkRxIntPending(int chan) {
 		scc.intpending|=((chan==0)?SCC_RR3_CHA_RX:SCC_RR3_CHB_RX);
 	} else {
 #ifdef SCC_DBG
-		printf("Resetting int pending for channel %d\n", chan);
+		MACPLUS_LOG("Resetting int pending for channel %d\n", chan);
 #endif
 		scc.intpending&=~((chan==0)?SCC_RR3_CHA_RX:SCC_RR3_CHB_RX);
 	}
@@ -385,7 +388,7 @@ static void triggerRx(int chan) {
 	int bufid=scc.chan[chan].rxBufCur;
 	if (scc.chan[chan].rx[bufid].data[0]==0xFF || scc.chan[chan].rx[bufid].data[0]==scc.chan[chan].sdlcaddr) {
 		scc.chan[chan].rxPos=0;
-		printf("WR15: 0x%X WR1: %X\n", scc.chan[chan].wr15, scc.chan[chan].wr1);
+		MACPLUS_LOG("WR15: 0x%X WR1: %X\n", scc.chan[chan].wr15, scc.chan[chan].wr1);
 		//Sync int
 		if (scc.chan[chan].wr15&SCC_WR15_SYNC) {
 			scc.intpending|=((chan==0)?SCC_RR3_CHA_EXT:SCC_RR3_CHB_EXT);
@@ -396,7 +399,7 @@ static void triggerRx(int chan) {
 		scc.chan[chan].hunting=0;
 		scc.chan[chan].eofDelay=scc.chan[chan].rx[bufid].len*3;
 	} else {
-		printf("...Not for us, ignoring.\n");
+		MACPLUS_LOG("...Not for us, ignoring.\n");
 		rxBufIgnoreRest(chan);
 	}
 }
@@ -428,7 +431,7 @@ void sccWrite(unsigned int addr, unsigned int val) {
 			scc.chan[chan].rr0Latched=-1;
 		} else if ((val&0x38)==0x18) {
 			//SCC abort: parse whatever we sent
-//			printf("SCC ABORT: Sent data\n");
+//			MACPLUS_LOG("SCC ABORT: Sent data\n");
 			sccTxFinished(chan);
 			checkRxIntPending(chan);
 		} else if ((val&0x38)==0x20) {
@@ -439,11 +442,11 @@ void sccWrite(unsigned int addr, unsigned int val) {
 			//Error Reset: kills special condition bytes from fifo
 			rxBufIgnoreRest(chan);
 			checkRxIntPending(chan);
-			printf("Error Reset Finished, pending=%x\n", scc.intpending);
+			MACPLUS_LOG("Error Reset Finished, pending=%x\n", scc.intpending);
 		} else if ((val&0x38)==0x38) {
 			//Reset Higher IUS
 		} else {
-			printf("Unknown command to reg 0: %X\n", val);
+			MACPLUS_LOG("Unknown command to reg 0: %X\n", val);
 			exit_when_strict();
 		}
 		if ((val&0xc0)==0) {
@@ -479,7 +482,7 @@ void sccWrite(unsigned int addr, unsigned int val) {
 		// No serial device or LocalTalk backend is attached.
 		scc.chan[chan].txTimer+=30;
 #ifdef SCC_DBG
-		printf("TX byte dropped; timer set to %d\n", scc.chan[chan].txTimer);
+		MACPLUS_LOG("TX byte dropped; timer set to %d\n", scc.chan[chan].txTimer);
 #endif
 	} else if (reg==9) {
 		scc.wr9=val;
@@ -502,18 +505,18 @@ void sccWrite(unsigned int addr, unsigned int val) {
 		} else if ((val&0xe0)==0x40) {
 			//reset missing clock
 		} else {
-			printf("Scc write undefined cmd to reg14: %x\n", val);
+			MACPLUS_LOG("Scc write undefined cmd to reg14: %x\n", val);
 			exit_when_strict();
 		}
 	} else if (reg==15) {
 		scc.chan[chan].wr15=val;
 		raiseInt(chan);
 	} else {
-		printf("Scc write to undefined reg: %x\n", reg);
+		// Unimplemented write register: ignore, as the physical SCC does.
 		exit_when_strict();
 	}
 	checkExtInt(chan);
-//	printf("SCC: write to addr %x chan %d reg %d val %x\n", addr, chan, reg, val);
+//	MACPLUS_LOG("SCC: write to addr %x chan %d reg %d val %x\n", addr, chan, reg, val);
 }
 
 
@@ -548,16 +551,14 @@ unsigned int sccRead(unsigned int addr) {
 		int rsn=0;
 
 #ifdef SCC_DBG
-		printf("Pending: 0x%X\n", scc.intpending);
+		MACPLUS_LOG("Pending: 0x%X\n", scc.intpending);
 #endif
 		if (scc.intpending & SCC_RR3_CHB_EXT) {
 			rsn=1;
 			scc.intpending&=~SCC_RR3_CHB_EXT;
-			extAcks[SCC_CHANB]++;
 		} else if (scc.intpending & SCC_RR3_CHA_EXT) {
 			rsn=5;
 			scc.intpending&=~SCC_RR3_CHA_EXT;
-			extAcks[SCC_CHANA]++;
 		} else if (scc.intpending & SCC_RR3_CHA_RX) {
 			rsn=6;
 			checkRxIntPending(0);
@@ -566,7 +567,7 @@ unsigned int sccRead(unsigned int addr) {
 			checkRxIntPending(1);
 		}
 #ifdef SCC_DBG
-		printf("Rsn: %d\n", rsn);
+		MACPLUS_LOG("Rsn: %d\n", rsn);
 #endif
 		val=scc.wr2;
 		if (scc.wr9&0x10) { //hi/lo
@@ -584,7 +585,7 @@ unsigned int sccRead(unsigned int addr) {
 			int left=0;
 			val=rxByte(chan, &left);
 #ifdef SCC_DBG
-			printf("SCC READ DATA val %x, %d bytes left\n", val, left);
+			MACPLUS_LOG("SCC READ DATA val %x, %d bytes left\n", val, left);
 #endif
 			if (left==1) { //because status goes with byte *to be read*, the last byte here is the EOM byte
 				scc.chan[chan].rxEom=1;
@@ -604,7 +605,10 @@ unsigned int sccRead(unsigned int addr) {
 	} else if (reg==15) {
 		val=scc.chan[chan].wr15;
 	} else {
-		printf("Scc read from undefined reg: %x\n", reg);
+		// Reserved/read-unimplemented SCC registers are commonly probed by
+		// the mouse interrupt path.  Return an inert value rather than making
+		// an otherwise valid input event reset the whole machine.
+		val=0;
 		exit_when_strict();
 	}
 	checkExtInt(chan);
@@ -622,7 +626,7 @@ void sccTick(int noTicks) {
 			scc.chan[n].txTimer-=noTicks;
 			if (scc.chan[n].txTimer<=0) {
 				scc.chan[n].txTimer=0;
-//				printf("Tx buffer empty: Sent data\n");
+//				MACPLUS_LOG("Tx buffer empty: Sent data\n");
 				sccTxFinished(n);
 				needCheck=1;
 			}
@@ -636,7 +640,7 @@ void sccTick(int noTicks) {
 			if (scc.chan[n].eofDelay<0) scc.chan[n].eofDelay=0;
 			if (scc.chan[n].eofDelay==0 && (scc.chan[n].wr1&0x10)!=0) {
 				//Int mode is recv char or special / special only
-				printf("Raise EOF int for channel %d\n", n);
+				MACPLUS_LOG("Raise EOF int for channel %d\n", n);
 				scc.chan[n].eofIntPending=1;
 				scc.intpending|=((n==0)?SCC_RR3_CHA_RX:SCC_RR3_CHB_RX);
 				raiseInt(n);
@@ -653,20 +657,7 @@ void sccTick(int noTicks) {
 }
 
 void sccInit() {
-	if (sccState == NULL) {
-		sccState = (Scc *)heap_caps_malloc(
-			sizeof(Scc), MALLOC_CAP_EXEC | MALLOC_CAP_8BIT);
-		if (sccState == NULL) sccState = (Scc *)malloc(sizeof(Scc));
-		if (sccState == NULL) {
-			printf("SCC: state allocation failed\n");
-			abort();
-		}
-	}
-	memset(sccState, 0, sizeof(Scc));
-	memset(dcdTransitions, 0, sizeof(dcdTransitions));
-	memset(extTriggers, 0, sizeof(extTriggers));
-	memset(extAcks, 0, sizeof(extAcks));
-	irqAsserted=0;
+    memset(sccState, 0, sizeof(Scc));
 	sccSetDcd(0, 1);
 	sccSetDcd(1, 1);
 //	scc.chan[0].txTimer=-1;
@@ -678,25 +669,4 @@ void sccInit() {
 		scc.chan[1].rx[x].delay=-1;
 	}
 	scc.guard=0x1234;
-}
-
-void sccDebugPrint(void) {
-	if (sccState == NULL) {
-		printf("SCCHW: not initialized\n");
-		return;
-	}
-	printf("SCCHW: pending=0x%02X irq=%d A[dcd=%d wr1=0x%02X wr15=0x%02X "
-		"edge=%lu trig=%lu ack=%lu] B[dcd=%d wr1=0x%02X wr15=0x%02X "
-		"edge=%lu trig=%lu ack=%lu]\n",
-		scc.intpending, irqAsserted,
-		scc.chan[SCC_CHANA].dcd, scc.chan[SCC_CHANA].wr1,
-		scc.chan[SCC_CHANA].wr15,
-		(unsigned long)dcdTransitions[SCC_CHANA],
-		(unsigned long)extTriggers[SCC_CHANA],
-		(unsigned long)extAcks[SCC_CHANA],
-		scc.chan[SCC_CHANB].dcd, scc.chan[SCC_CHANB].wr1,
-		scc.chan[SCC_CHANB].wr15,
-		(unsigned long)dcdTransitions[SCC_CHANB],
-		(unsigned long)extTriggers[SCC_CHANB],
-		(unsigned long)extAcks[SCC_CHANB]);
 }
