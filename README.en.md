@@ -19,9 +19,16 @@ Launcher and Full editions have the same features; only their Flash layouts diff
 
 Prepare `hd.img` yourself. Put it in the root of a FAT32 SD card, or upload it through Wi-Fi.
 
-The image must be a partitioned Macintosh hard disk with an Apple partition map, boot driver, and HFS/MFS partition. Its size must be 512-byte aligned. A raw 400K/800K floppy cannot be used as `hd.img`.
+The image must be a partitioned Macintosh hard disk with an Apple partition map, boot driver, and HFS/MFS partition. Its size must be 512-byte aligned.
 
 On first boot, the device copies the system disk to the `macplus` partition. Later emulation runs from the Flash mapping and never performs random system-disk reads from SD. Enlarging the partition automatically increases the available image capacity.
+
+## Controls
+
+- `Ctrl`: Command; `Opt`: Option; `Alt`: Control; `Shift`: Shift.
+- G0: mouse button.
+- Tilt: moves the mouse and viewport.
+- Hold `Ctrl + Alt + Opt` for two seconds: Wi-Fi transfer mode.
 
 ## Software installation
 
@@ -33,13 +40,6 @@ Supported files are 400K/800K `.dsk`, `.img`, and Disk Copy 4.2 `.dc42` images. 
 4. Open the floppy icon in Finder and copy the application to the system disk.
 
 Hold any key or G0 for two seconds to leave Wi-Fi transfer mode.
-
-## Controls
-
-- `Ctrl`: Command; `Opt`: Option; `Alt`: Control; `Shift`: Shift.
-- G0: mouse button.
-- Tilt: moves the mouse and viewport.
-- Hold `Ctrl + Alt + Opt` for two seconds: Wi-Fi transfer mode.
 
 ## Build
 

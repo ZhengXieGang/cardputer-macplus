@@ -17,11 +17,18 @@ Launcher 版和 Full 版功能相同，区别只在 Flash 布局。Launcher 版�
 
 ## 准备系统盘
 
-`hd.img` 由用户自行准备，可以放在 FAT32 SD 卡根目录，也可以通过 Wi-Fi 页面上传。
+`hd.img` 自行准备，可以放在 FAT32 SD 卡根目录，也可以通过 Wi-Fi 页面上传。
 
-镜像必须是 Macintosh 分区硬盘，包含 Apple 分区表、启动驱动和 HFS/MFS 分区，并且大小按 512 字节对齐。400K/800K 裸软盘不能直接作为 `hd.img`。
+镜像必须是 Macintosh 分区硬盘，包含 Apple 分区表、启动驱动和 HFS/MFS 分区，并且大小按 512 字节对齐。
 
 首次启动时，设备会把系统盘复制到 `macplus` 分区；之后模拟器从 Flash 映射运行，不会从 SD 卡随机读取系统盘。分区扩大后，固件会自动使用新增容量。
+
+## 操作
+
+- `Ctrl`：Command；`Opt`：Option；`Alt`：Control；`Shift`：Shift。
+- G0：鼠标键；
+- 倾斜设备：移动鼠标和画面。
+- `Ctrl + Alt + Opt` 长按两秒：Wi-Fi 传输模式。
 
 ## 安装软件
 
@@ -32,20 +39,7 @@ Launcher 版和 Full 版功能相同，区别只在 Flash 布局。Launcher 版�
 3. 上传软件盘，设备写入完成后自动重启。
 4. 在 Finder 打开软盘图标，把应用复制到系统硬盘。
 
-Wi-Fi 传输模式下，设备屏幕自带维护菜单，不需要打开网页修改设置：
-
-- `;` / `.`：上移 / 下移；`,` / `/`：减小 / 增大当前数值。
-- `Enter` 或 G0：执行当前项；可调鼠标满倾斜速度（默认 320 px/s）和音量，也可清除 Flash 中的 `hd.img` 缓存或删除 SD 卡软件盘。
-- 网页客户端只负责上传系统盘和软件盘镜像。
-
 长按任意键或 G0 两秒退出 Wi-Fi 模式。
-
-## 操作
-
-- `Ctrl`：Command；`Opt`：Option；`Alt`：Control；`Shift`：Shift。
-- G0：鼠标键；
-- 倾斜设备：移动鼠标和画面。
-- `Ctrl + Alt + Opt` 长按两秒：Wi-Fi 传输模式。
 
 ## 构建
 
