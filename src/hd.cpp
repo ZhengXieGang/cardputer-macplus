@@ -20,6 +20,7 @@ extern "C" {
 #include "tme/disp.h"
 #include "tme/ncr.h"
 #include "tme/hd.h"
+#include "ff.h"
 }
 
 // One flash-sector-sized cache block is both the runtime write-back buffer
@@ -28,6 +29,10 @@ extern "C" {
 static constexpr size_t HD_SD_IO_CHUNK_BYTES = 8 * 1024;
 static constexpr size_t HD_CACHE_BLOCK_BYTES = 4096;
 static constexpr size_t HD_CACHE_BLOCK_COUNT = 1;
+// xTaskCreatePinnedToCore takes stack depth in words (not bytes).  Two
+// thousand words cover the flash journal/write-back call chain while staying
+// within the no-PSRAM heap, allowing flushes to stay off the 68K task.
+static constexpr uint32_t HD_FLUSH_TASK_STACK_WORDS = 2048U;
 // Keep the power-loss window short.  Reads still come from the mapped Flash
 // image; this only affects the low-priority write-back task.
 static constexpr uint32_t HD_FLUSH_INTERVAL_MS = 250;
@@ -54,6 +59,9 @@ static constexpr uint32_t INSTALL_800K_BYTES =
 // the same SD lookup many times while Finder scans an HFS catalog. One 8 KiB
 // window covers a complete outer-track side (12 sectors) within the no-PSRAM
 // memory budget.
+// The no-PSRAM target needs one contiguous 256 KiB block for Mac RAM. Keep
+// this cache at 8 KiB so it does not compete with the contiguous Mac RAM
+// allocation.
 static constexpr size_t INSTALL_READ_CACHE_BYTES = 8 * 1024;
 static_assert((INSTALL_READ_CACHE_BYTES % 512U) == 0,
               "install read cache must be sector aligned");
@@ -69,15 +77,19 @@ static uint32_t hdCacheMetadata = 0;
 static uint32_t hdCacheImageMax = 0;
 
 struct InstallVolume {
-    FILE *file;
+    FIL *file;
     uint32_t bytes;
     bool isMfs;
     bool readOnly;
 };
 
 static InstallVolume installVolume = {};
-static uint8_t installReadCache[INSTALL_READ_CACHE_BYTES];
-static uint8_t installWarmupSector[512];
+// FatFS keeps a private 512-byte sector window in each FIL.  This object is
+// reserved dynamically immediately after Mac RAM, before board/SD setup
+// fragments the remaining heap.
+static FIL *reservedInstallFile = nullptr;
+alignas(4) static uint8_t installReadCache[INSTALL_READ_CACHE_BYTES];
+alignas(4) static uint8_t installWarmupSector[512];
 struct InstallReadCache {
     uint32_t baseSector;
     uint32_t sectorCount;
@@ -360,7 +372,15 @@ static bool prepareInstallVolume(void) {
         remove(INSTALL_BACKUP_PATH);
     }
     uint8_t signature[2] = {};
-    FILE *file = nullptr;
+    // FIL contains FatFS's sector buffer. It was reserved immediately after
+    // Mac RAM, before SD/display/audio allocations fragment the heap.
+    FIL *file = reservedInstallFile;
+    if (file == nullptr) {
+        sdcardRelease();
+        MACPLUS_LOG("INSTALL: FatFS file buffer allocation failed\n");
+        return false;
+    }
+    memset(file, 0, sizeof(*file));
     const bool sizeValid = stat(INSTALL_IMAGE_PATH, &info) == 0 &&
         (info.st_size == INSTALL_400K_BYTES ||
          info.st_size == INSTALL_800K_BYTES);
@@ -368,39 +388,36 @@ static bool prepareInstallVolume(void) {
         MACPLUS_LOG("INSTALL: missing or invalid image size=%ld errno=%d\n",
                static_cast<long>(info.st_size), errno);
     }
-    int openError = 0;
+    FRESULT openResult = FR_NO_FILE;
     if (sizeValid) {
-        errno = 0;
-        file = fopen(INSTALL_IMAGE_PATH, "r+b");
-        openError = errno;
+        openResult = f_open(file, "0:/macplus-install.img", FA_READ | FA_WRITE);
     }
     bool readOnly = false;
-    if (file == nullptr && sizeValid) {
+    if (openResult != FR_OK && sizeValid) {
         // A physically or FAT-level write-protected card can still expose the
         // software disk for reading.  Report that state to the Mac instead of
         // pretending a writable disk is available.
-        errno = 0;
-        file = fopen(INSTALL_IMAGE_PATH, "rb");
-        if (openError == 0) openError = errno;
-        readOnly = file != nullptr;
+        memset(file, 0, sizeof(*file));
+        openResult = f_open(file, "0:/macplus-install.img", FA_READ);
+        readOnly = openResult == FR_OK;
     }
-    const bool valid = file != nullptr &&
-        fseek(file, 1024L, SEEK_SET) == 0 &&
-        fread(signature, 1, sizeof(signature), file) == sizeof(signature) &&
+    UINT signatureRead = 0;
+    const bool valid = openResult == FR_OK &&
+        f_lseek(file, 1024U) == FR_OK &&
+        f_read(file, signature, sizeof(signature), &signatureRead) == FR_OK &&
+        signatureRead == sizeof(signature) &&
         ((signature[0] == 0x42 && signature[1] == 0x44) ||
          (signature[0] == 0xD2 && signature[1] == 0xD7));
     if (!valid) {
-        if (file == nullptr && sizeValid) {
-            MACPLUS_LOG("INSTALL: cannot open %s (errno=%d)\n",
-                   INSTALL_IMAGE_PATH, openError);
+        if (openResult != FR_OK && sizeValid) {
+            MACPLUS_LOG("INSTALL: cannot open %s (FatFS=%d)\n",
+                   INSTALL_IMAGE_PATH, static_cast<int>(openResult));
         }
-        if (file != nullptr) fclose(file);
+        if (openResult == FR_OK) f_close(file);
+        memset(file, 0, sizeof(*file));
         sdcardRelease();
         return false;
     }
-    // Use a buffered stream so each 8 KiB cache fill is handled as a
-    // multi-sector FatFS read instead of many tiny stdio transactions.
-    setvbuf(file, nullptr, _IOFBF, INSTALL_READ_CACHE_BYTES);
     installVolume.file = file;
     installVolume.bytes = static_cast<uint32_t>(info.st_size);
     installVolume.isMfs = signature[0] == 0xD2;
@@ -454,10 +471,35 @@ int hdReadInstallSector(uint32_t sector, uint8_t *destination) {
         const uint32_t totalSectors = installVolume.bytes / 512U;
         const uint32_t count = (totalSectors - base) < cacheSectors
                                    ? totalSectors - base : cacheSectors;
-        ok = fseek(installVolume.file, static_cast<long>(base) * 512L,
-                   SEEK_SET) == 0 &&
-             fread(installReadCache, 512U, count,
-                   installVolume.file) == count;
+        int seekResult = -1;
+        size_t bytesRead = 0;
+        const size_t requestedBytes = static_cast<size_t>(count) * 512U;
+        int streamError = 0;
+        int errorNumber = 0;
+        /* A card can return a short FatFS read after a long seek. Reopen is
+           intentionally avoided here; the direct FIL state remains usable
+           after a transient retry. */
+        ok = false;
+        for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+            const long fileOffset = static_cast<long>(base) * 512L;
+            /* Keep every cache fill anchored by an absolute file offset. The
+               same FIL is also used by the .Sony block path; relying on its
+               previous cursor lets an interleaved request return a valid but
+               unrelated sector window. */
+            seekResult = f_lseek(installVolume.file,
+                                 static_cast<FSIZE_t>(fileOffset)) == FR_OK
+                ? 0 : -1;
+            UINT transferred = 0;
+            const FRESULT readResult = seekResult == 0
+                ? f_read(installVolume.file, installReadCache,
+                         static_cast<UINT>(requestedBytes), &transferred)
+                : FR_DISK_ERR;
+            bytesRead = transferred;
+            streamError = readResult == FR_OK ? 0 : static_cast<int>(readResult);
+            errorNumber = 0;
+            ok = seekResult == 0 && readResult == FR_OK &&
+                 bytesRead == requestedBytes;
+        }
         if (ok) {
             installReadCacheState.baseSector = base;
             installReadCacheState.sectorCount = count;
@@ -465,6 +507,12 @@ int hdReadInstallSector(uint32_t sector, uint8_t *destination) {
         } else {
             installReadCacheState.valid = false;
             installReadCacheState.sectorCount = 0;
+            MACPLUS_LOG("INSTALL: SD read failed at sector %lu "
+                   "seek=%d read=%lu/%lu ferror=%d errno=%d\n",
+                   static_cast<unsigned long>(sector), seekResult,
+                   static_cast<unsigned long>(bytesRead),
+                   static_cast<unsigned long>(requestedBytes), streamError,
+                   errorNumber);
         }
         sdcardRelease();
     }
@@ -473,8 +521,6 @@ int hdReadInstallSector(uint32_t sector, uint8_t *destination) {
                    (sector - installReadCacheState.baseSector) * 512U,
                512U);
     }
-    if (!ok) MACPLUS_LOG("INSTALL: SD read failed at sector %lu\n",
-                    static_cast<unsigned long>(sector));
     return ok ? 1 : 0;
 }
 
@@ -484,9 +530,12 @@ int hdWriteInstallSector(uint32_t sector, const uint8_t *source) {
         return 0;
     }
     if (!sdcardAcquire(1000)) return 0;
-    const bool ok = fseek(installVolume.file, static_cast<long>(sector) * 512L,
-                          SEEK_SET) == 0 &&
-                    fwrite(source, 1, 512U, installVolume.file) == 512U;
+    const bool seekOk = f_lseek(installVolume.file,
+                                static_cast<FSIZE_t>(sector) * 512U) == FR_OK;
+    UINT written = 0;
+    const bool ok = seekOk &&
+                    f_write(installVolume.file, source, 512U, &written) == FR_OK &&
+                    written == 512U;
     sdcardRelease();
     if (ok) {
         if (installReadCacheState.valid &&
@@ -506,16 +555,60 @@ int hdWriteInstallSector(uint32_t sector, const uint8_t *source) {
 }
 
 int hdReadInstallBytes(uint32_t offset, uint8_t *destination, uint32_t bytes) {
-    if (destination == nullptr || (offset & 511U) != 0U ||
+    if (installVolume.file == nullptr || destination == nullptr ||
+        (offset & 511U) != 0U ||
         (bytes & 511U) != 0U ||
         offset > installVolume.bytes || bytes > installVolume.bytes - offset) {
         return 0;
     }
+
+    // Block-level .Sony reads are already sector aligned. Handle one bounded
+    // multi-sector request at a time; the IWM bitstream path continues to use
+    // the same cache for small random sector reads.
+    if (bytes >= 2048U && bytes <= sizeof(installReadCache)) {
+        if (!sdcardAcquire(2000)) return 0;
+        const FSIZE_t fileOffset = static_cast<FSIZE_t>(offset);
+        const bool seekOk = f_lseek(installVolume.file, fileOffset) == FR_OK;
+        UINT transferred = 0;
+        /* SDSPI/FatFS can use DMA for a large read. Read into the aligned
+           cache buffer first, then copy to the emulated RAM, whose 24-bit
+           address may be only 2-byte aligned or wrap at 256 KiB. */
+        const bool ok = seekOk &&
+            f_read(installVolume.file, installReadCache,
+                   static_cast<UINT>(bytes),
+                   &transferred) == FR_OK && transferred == bytes;
+        if (ok) memcpy(destination, installReadCache, bytes);
+        // The direct stream may overlap the existing cache; do not let the
+        // next IWM request consume stale sectors from that window.
+        installReadCacheState.valid = false;
+        sdcardRelease();
+        return ok ? 1 : 0;
+    }
+
     uint32_t sector = offset / 512U;
     while (bytes != 0U) {
-        if (!hdReadInstallSector(sector++, destination)) return 0;
-        destination += 512U;
-        bytes -= 512U;
+        if (installReadCacheState.valid &&
+            sector >= installReadCacheState.baseSector &&
+            sector < installReadCacheState.baseSector +
+                         installReadCacheState.sectorCount) {
+            const uint32_t available =
+                installReadCacheState.baseSector +
+                installReadCacheState.sectorCount - sector;
+            const uint32_t count = available * 512U < bytes
+                ? available * 512U : bytes;
+            memcpy(destination,
+                   installReadCache +
+                       (sector - installReadCacheState.baseSector) * 512U,
+                   count);
+            sector += count / 512U;
+            destination += count;
+            bytes -= count;
+        } else {
+            if (!hdReadInstallSector(sector, destination)) return 0;
+            ++sector;
+            destination += 512U;
+            bytes -= 512U;
+        }
     }
     return 1;
 }
@@ -529,8 +622,13 @@ int hdWriteInstallBytes(uint32_t offset, const uint8_t *source, uint32_t bytes) 
     }
     if (bytes == 0U) return 1;
     if (!sdcardAcquire(2000)) return 0;
-    const bool ok = fseek(installVolume.file, static_cast<long>(offset), SEEK_SET) == 0 &&
-                    fwrite(source, 1, bytes, installVolume.file) == bytes;
+    const bool seekOk = f_lseek(installVolume.file,
+                                static_cast<FSIZE_t>(offset)) == FR_OK;
+    UINT written = 0;
+    const bool ok = seekOk && bytes <= UINT_MAX &&
+                    f_write(installVolume.file, source,
+                            static_cast<UINT>(bytes), &written) == FR_OK &&
+                    written == bytes;
     sdcardRelease();
     if (!ok) {
         MACPLUS_LOG("INSTALL: SD write failed at offset %lu (%lu bytes)\n",
@@ -561,10 +659,11 @@ int hdWriteInstallBytes(uint32_t offset, const uint8_t *source, uint32_t bytes) 
 int hdFlushInstallVolume(void) {
     if (installVolume.file == nullptr || installVolume.readOnly) return 0;
     if (!sdcardAcquire(2000)) return 0;
-    const int result = fflush(installVolume.file);
+    const FRESULT result = f_sync(installVolume.file);
     sdcardRelease();
-    if (result != 0) {
-        MACPLUS_LOG("INSTALL: SD flush failed (errno=%d)\n", errno);
+    if (result != FR_OK) {
+        MACPLUS_LOG("INSTALL: SD flush failed (FatFS=%d)\n",
+               static_cast<int>(result));
         return 0;
     }
     return 1;
@@ -635,9 +734,20 @@ static TaskHandle_t flushTaskHandle = nullptr;
 static HdPriv *reservedHd = nullptr;
 static SCSIDevice *reservedDev = nullptr;
 
-// Reserve the HD objects before M5/SD fragment the heap.  With the integrated
-// WiFi build the heap is tight, and this guarantees hdCreate() can always get
-// its structures even when the largest free block after mount is tiny.
+// Reserve the FatFS object immediately after Mac RAM, then reserve the HD
+// objects after the SCSI/task block.  Keeping these phases separate avoids
+// consuming the last usable contiguous block during board setup.
+void hdReserveInstallFile(void) {
+    if (reservedInstallFile == nullptr) {
+        reservedInstallFile = static_cast<FIL *>(malloc(sizeof(FIL)));
+        if (reservedInstallFile != nullptr) {
+            memset(reservedInstallFile, 0, sizeof(*reservedInstallFile));
+        }
+    }
+    MACPLUS_LOG("HD: reserved floppy %s\n",
+           reservedInstallFile != nullptr ? "OK" : "FAIL");
+}
+
 void hdReserveStorage(void) {
     if (reservedHd == nullptr) {
         reservedHd = static_cast<HdPriv *>(malloc(sizeof(HdPriv)));
@@ -645,9 +755,10 @@ void hdReserveStorage(void) {
     if (reservedDev == nullptr) {
         reservedDev = static_cast<SCSIDevice *>(malloc(sizeof(SCSIDevice)));
     }
-    MACPLUS_LOG("HD: reserved storage %s%s\n",
+    MACPLUS_LOG("HD: reserved storage %s%s%s\n",
            reservedHd != nullptr ? "hd" : "hd-FAIL",
-           reservedDev != nullptr ? "+dev" : "+dev-FAIL");
+           reservedDev != nullptr ? "+dev" : "+dev-FAIL",
+           reservedInstallFile != nullptr ? "+floppy" : "+floppy-FAIL");
 }
 
 int hdIsDeviceReady(const SCSIDevice *device) {
@@ -769,13 +880,6 @@ static uint32_t readBe32(const uint8_t *data) {
     return (static_cast<uint32_t>(data[0]) << 24) |
            (static_cast<uint32_t>(data[1]) << 16) |
            (static_cast<uint32_t>(data[2]) << 8) | data[3];
-}
-
-static void writeBe32(uint8_t *data, uint32_t value) {
-    data[0] = static_cast<uint8_t>(value >> 24);
-    data[1] = static_cast<uint8_t>(value >> 16);
-    data[2] = static_cast<uint8_t>(value >> 8);
-    data[3] = static_cast<uint8_t>(value);
 }
 
 typedef bool (*MacImageReader)(void *context, uint32_t offset,
@@ -1119,8 +1223,9 @@ bool hdRemoveInstallImage(void) {
     if (!sdcardMounted() || !sdcardAcquire(2000)) return false;
 
     if (installVolume.file != nullptr) {
-        fflush(installVolume.file);
-        fclose(installVolume.file);
+        f_sync(installVolume.file);
+        f_close(installVolume.file);
+        memset(installVolume.file, 0, sizeof(*installVolume.file));
         installVolume.file = nullptr;
         installVolume.bytes = 0;
         installVolume.isMfs = false;
@@ -1506,36 +1611,6 @@ static bool exportedRangeIsValid(const HdPriv *hd, unsigned int lba,
     const uint32_t sectors = static_cast<uint32_t>(bytes / 512U);
     const uint32_t blocks = exportedBlockCount(hd);
     return lba <= blocks && sectors <= blocks - lba;
-}
-
-static void patchExportedPartitionBlock(HdPriv *hd, uint32_t lba,
-                                        uint8_t *block) {
-    const uint32_t baseBlocks = static_cast<uint32_t>(hd->size / 512U);
-    const uint32_t totalBlocks = exportedBlockCount(hd);
-
-    if (lba == 0) {
-        writeBe32(block + 4, totalBlocks);
-    } else if (lba >= 1 && lba <= 3) {
-        writeBe32(block + 4, 4); // Apple partition-map entry count
-    } else if (lba == 4) {
-        // Reuse the known-good HFS partition descriptor as a template.
-        // Block 4 is free map space in the system image.
-        if (!readImageCached(hd, 3, block, 512)) {
-            memset(block, 0, 512);
-            block[0] = 'P';
-            block[1] = 'M';
-        }
-        writeBe32(block + 4, 4);
-        writeBe32(block + 8, baseBlocks);
-        writeBe32(block + 12, installVolume.bytes / 512U);
-        memset(block + 16, 0, 32);
-        memcpy(block + 16, "Install Disk", 12);
-        memset(block + 48, 0, 32);
-        memcpy(block + 48, installVolume.isMfs ? "Apple_MFS" : "Apple_HFS",
-               9);
-        writeBe32(block + 80, 0);
-        writeBe32(block + 84, installVolume.bytes / 512U);
-    }
 }
 
 static bool readExportedImage(HdPriv *hd, unsigned int lba, uint8_t *buffer,
@@ -1946,11 +2021,11 @@ SCSIDevice *hdCreate(void) {
     if (hd->primary && hd->mutex == nullptr) {
         MACPLUS_LOG("HD: mutex unavailable; async flush disabled\n");
     } else if (hd->primary && flushTaskHandle == nullptr) {
-        // Flash/FatFS calls can use more than the usual 8KB task stack on
-        // this target. If the larger stack cannot be allocated, leave the
-        // handle null and hdFlushIfDue() will flush from the emulator task.
+        // Keep the flash write-back task small enough for the no-PSRAM heap;
+        // xTaskCreatePinnedToCore's depth is measured in words.
         const BaseType_t flushTaskResult = xTaskCreatePinnedToCore(
-            hdFlushTask, "hd-flush", 4096, hd, 1, &flushTaskHandle, 1);
+            hdFlushTask, "hd-flush", HD_FLUSH_TASK_STACK_WORDS, hd, 1,
+            &flushTaskHandle, 1);
         if (flushTaskResult != pdPASS) {
             flushTaskHandle = nullptr;
             MACPLUS_LOG("HD: async flush task unavailable; using emulator fallback\n");

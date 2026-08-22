@@ -12,7 +12,8 @@ namespace {
 constexpr const char *kNamespace = "macplus";
 constexpr const char *kPointerSpeedKey = "ptr_speed_pct";
 constexpr const char *kLegacySensitivityKey = "imu_sens10";
-constexpr const char *kVolumeKey = "volume";
+constexpr const char *kVolumePercentKey = "volume_pct";
+constexpr const char *kLegacyVolumeKey = "volume";
 
 static uint16_t clampPointerSpeedPercent(uint32_t value) {
     if (value < IMU_POINTER_SPEED_MIN_PERCENT) {
@@ -47,26 +48,38 @@ void loadMacSettings(void) {
         }
     }
 
-    uint8_t volume = 0;
-    if (nvs_get_u8(handle, kVolumeKey, &volume) == ESP_OK) {
-        sndSetVolume(volume);
+    uint8_t volumePercent = 0;
+    if (nvs_get_u8(handle, kVolumePercentKey, &volumePercent) == ESP_OK) {
+        sndSetVolume(volumePercent);
+    } else {
+        // Older builds stored M5Unified's raw 0..255 master value and the
+        // web menu displayed it linearly. Convert that legacy value once.
+        uint8_t legacyVolume = 0;
+        if (nvs_get_u8(handle, kLegacyVolumeKey, &legacyVolume) == ESP_OK) {
+            sndSetVolume(static_cast<uint8_t>(
+                (static_cast<unsigned>(legacyVolume) * 100U + 127U) / 255U));
+        }
     }
     nvs_close(handle);
 }
 
-bool saveMacSettings(uint16_t pointerSpeedPercent, uint8_t volume) {
+bool saveMacSettings(uint16_t pointerSpeedPercent, uint8_t volumePercent) {
     pointerSpeedPercent = clampPointerSpeedPercent(pointerSpeedPercent);
 
     nvs_handle_t handle;
     if (nvs_open(kNamespace, NVS_READWRITE, &handle) != ESP_OK) return false;
     esp_err_t error =
         nvs_set_u16(handle, kPointerSpeedKey, pointerSpeedPercent);
-    if (error == ESP_OK) error = nvs_set_u8(handle, kVolumeKey, volume);
+    if (error == ESP_OK) {
+        if (volumePercent < 1U) volumePercent = 1U;
+        if (volumePercent > 100U) volumePercent = 100U;
+        error = nvs_set_u8(handle, kVolumePercentKey, volumePercent);
+    }
     if (error == ESP_OK) error = nvs_commit(handle);
     nvs_close(handle);
     if (error != ESP_OK) return false;
 
     imuPointerSpeedPercent = pointerSpeedPercent;
-    sndSetVolume(volume);
+    sndSetVolume(volumePercent);
     return true;
 }

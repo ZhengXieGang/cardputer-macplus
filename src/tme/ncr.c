@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "esp_heap_caps.h"
 #include "ncr.h"
 #include "m68k.h"
 
@@ -121,11 +120,7 @@ void ncrInit(void) {
 	if (scsiDataBuffer != NULL) {
 		ncr.data.data = scsiDataBuffer;
 	} else {
-		ncr.data.data = (uint8_t *)heap_caps_malloc(
-			SCSI_DATA_BUFFER_BYTES, MALLOC_CAP_EXEC | MALLOC_CAP_8BIT);
-		if (ncr.data.data == NULL) {
-			ncr.data.data = (uint8_t *)malloc(SCSI_DATA_BUFFER_BYTES);
-		}
+		ncr.data.data = (uint8_t *)malloc(SCSI_DATA_BUFFER_BYTES);
 	}
 	if (ncr.data.data != NULL) {
 		ncr.data.dataCapacity = SCSI_DATA_BUFFER_BYTES;

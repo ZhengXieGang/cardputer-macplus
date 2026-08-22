@@ -3,6 +3,7 @@
 #include <stdbool.h>
 
 SCSIDevice *hdCreate(void);
+void hdReserveInstallFile(void);
 void hdReserveStorage(void);
 bool hdPrepareInstallVolume(void);
 int hdIsDeviceReady(const SCSIDevice *device);

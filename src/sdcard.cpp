@@ -35,6 +35,14 @@ void sdcardRelease() {
 }
 
 static void sdPinsIdle() {
+    // Match M5 Launcher Cardputer-Adv setup. These external/strap lines can
+    // otherwise leave the SD socket's shared chip-select path active after a
+    // Launcher-to-app reboot.
+    const int launcherPins[] = {3, 4, 5, 6, 13, 15};
+    for (int pin : launcherPins) {
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, HIGH);
+    }
     pinMode(SD_SPI_CS_PIN, OUTPUT);
     digitalWrite(SD_SPI_CS_PIN, HIGH);
     pinMode(SD_SPI_CLK_PIN, OUTPUT);
@@ -59,8 +67,8 @@ static uint8_t sdProbeTransfer(uint8_t value) {
 }
 
 // Reset a card left in an interrupted SPI transaction before handing the bus
-// to the IDF SDSPI driver. This stays bit-banged so it cannot disturb the
-// display's separate SPI service and makes repeated app resets deterministic.
+// to the IDF SDSPI driver. Keep this bit-banged: constructing an Arduino
+// SPIClass here can claim the display's SPI peripheral during startup.
 static bool sdRawInit() {
     (void)SD_SPI_PROBE_FREQ_HZ;
     sdPinsIdle();
@@ -132,9 +140,9 @@ bool sdcardInit() {
     slot_config.gpio_cs = static_cast<gpio_num_t>(SD_SPI_CS_PIN);
     slot_config.gpio_int = GPIO_NUM_NC;
 
-    // The no-PSRAM target has a tight FatFS heap budget. setup() keeps the
-    // software-disk stream open only after the raw system cache is valid, so
-    // one descriptor is sufficient and leaves room for the emulator.
+    // The no-PSRAM target cannot afford a second FatFS descriptor during
+    // mount. hdCreate() closes /sd/hd.img after mapping the Flash cache and
+    // opens the optional software disk afterward, so one descriptor is enough.
     constexpr uint8_t kMaxOpenFiles = 1;
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,

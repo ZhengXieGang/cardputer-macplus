@@ -5,16 +5,14 @@
 // The Mac Plus SCSI Manager caps transfers at 64KB.  System 3.x drivers
 // issue reads larger than this window when loading bigger applications (e.g.
 // Font/DA Mover asks for 37 sectors = 18944 bytes); ncr.c splits such
-// transfers into dataCapacity-sized chunks, so an 8KB window is enough.  It
-// is allocated from IRAM (main.cpp) to keep the internal-DRAM budget for the
-// 256KB Mac RAM and SD card.
+// transfers into dataCapacity-sized chunks, so a 4KB window is enough while
+// leaving room for the no-PSRAM emulator task stack.
 #ifndef SCSI_DATA_BUFFER_BYTES
-#define SCSI_DATA_BUFFER_BYTES (16U * 512U)
+#define SCSI_DATA_BUFFER_BYTES (8U * 512U)
 #endif
 
-// Reserved very early by main.cpp (before SD/M5 fragment the heap), so the
-// DMA window survives the no-PSRAM SRAM budget.  NULL means ncrInit()
-// falls back to allocating late (which may fail once the heap is fragmented).
+// Reserved by main.cpp before the 68K task starts. NULL means ncrInit() falls
+// back to allocating late, which may fail once the heap is fragmented.
 extern uint8_t *scsiDataBuffer;
 
 typedef struct {

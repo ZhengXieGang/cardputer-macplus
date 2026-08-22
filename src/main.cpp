@@ -40,6 +40,10 @@ extern "C" {
 static char pram[32];
 static volatile bool bootOk = false;
 static const uint8_t *romData = nullptr;
+static StaticTask_t emuTaskControl;
+static StackType_t *emuTaskStack = nullptr;
+static uint8_t *emuResourceBlock = nullptr;
+static constexpr size_t kEmuTaskStackBytes = 4608U;
 
 #define MAC_PLUS_ROM_INITIAL_PC 0x0040002AUL
 #define MAC_PLUS_ROM_CHECKSUM 0x4D1F8172UL
@@ -171,8 +175,8 @@ void setup() {
         return;
     }
 
-    // Reserve the emulated Mac RAM while the heap is still pristine. The SD
-    // driver is initialized after M5GFX so it cannot collide with the
+    // Reserve the emulated Mac RAM while the ordinary heap is still pristine.
+    // The SD driver is initialized after M5GFX so it cannot collide with the
     // display's SPI bus probe.
     macRam = static_cast<unsigned char *>(malloc(TME_RAMSIZE));
     if (macRam == nullptr) {
@@ -185,6 +189,10 @@ void setup() {
         return;
     }
     MACPLUS_LOG("Mac RAM reserved at %p (%d bytes)\n", macRam, TME_RAMSIZE);
+    // Reserve the FatFS software-disk object while the heap still has a
+    // large block. HD's larger runtime object is reserved later, after the
+    // SCSI/task block has been secured.
+    hdReserveInstallFile();
     // Defer speaker allocation until after the contiguous Mac RAM block is
     // reserved. sndInit() configures the speaker and codec itself, so the
     // ES8311 does not get enabled abruptly by M5Unified during board setup.
@@ -198,16 +206,29 @@ void setup() {
     // Allocate the small display crop immediately after the large contiguous
     // Mac RAM block, before the remaining emulator services fragment the heap.
     dispInit();
-    // Reserve the SCSI DMA window early too.  It lives in IRAM (data-bus
-    // accessible on ESP32-S3) so it does not shrink the internal-DRAM heap
-    // needed by the 256KB Mac RAM, SD mount and display.
-    scsiDataBuffer = static_cast<uint8_t *>(heap_caps_malloc(
-        SCSI_DATA_BUFFER_BYTES, MALLOC_CAP_EXEC | MALLOC_CAP_8BIT));
-    if (scsiDataBuffer == nullptr) {
-        scsiDataBuffer = static_cast<uint8_t *>(malloc(SCSI_DATA_BUFFER_BYTES));
+    // Both buffers share the one contiguous DMA-capable internal block.  The
+    // 4 KiB SCSI window is sufficient because ncr.c refills large transfers
+    // in chunks; keeping the task stack at 4.5 KiB avoids D/IRAM fragmentation.
+    emuResourceBlock = static_cast<uint8_t *>(heap_caps_malloc(
+        SCSI_DATA_BUFFER_BYTES + kEmuTaskStackBytes,
+        MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+    if (emuResourceBlock == nullptr) {
+        MACPLUS_LOG("FATAL: cannot allocate SCSI/task buffers (free=%u largest=%u)\n",
+               static_cast<unsigned>(esp_get_free_heap_size()),
+               static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_8BIT)));
+        return;
     }
-    MACPLUS_LOG("SCSI buffer reserved at %p (%d bytes)\n",
-           scsiDataBuffer, SCSI_DATA_BUFFER_BYTES);
+    scsiDataBuffer = emuResourceBlock;
+    emuTaskStack = reinterpret_cast<StackType_t *>(
+        emuResourceBlock + SCSI_DATA_BUFFER_BYTES);
+    MACPLUS_LOG("EMU: SCSI buffer=%p task stack=%p (%u/%u bytes)\n",
+           scsiDataBuffer, emuTaskStack,
+           static_cast<unsigned>(SCSI_DATA_BUFFER_BYTES),
+           static_cast<unsigned>(kEmuTaskStackBytes));
+
+    // Reserve the larger HD objects only after the emulator's contiguous
+    // SCSI/task block is secured; the FatFS FIL was reserved above while the
+    // heap still had a large block.
     hdReserveStorage();
     bootOk = true;
 
@@ -234,14 +255,6 @@ void setup() {
     cardputerInputInit();
 
     if (sdReady) macplusStorageSetup();
-    if (sdReady) {
-        /* Open the optional software disk on the setup task. Its FATFS/newlib
-           call chain is too deep for the 68000 task's tight no-PSRAM stack;
-           the normal runtime already has a valid raw Flash system cache, so
-           the single SD file slot can be dedicated to this stream. */
-        hdPrepareInstallVolume();
-    }
-
     loadPram();
     rtcInit(pram);
     const bool romReady = validateEmbeddedRom();
@@ -271,12 +284,22 @@ void setup() {
 
     // Start emulation on core 0; the display task starts inside tmeStartEmu
     // on core 1.
-    const BaseType_t taskResult =
-        // The optional software disk is prepared above, so keep the task at
-        // the 12 KiB stack that fits alongside the no-PSRAM display/SD heap.
-        xTaskCreatePinnedToCore(emuTask, "emu", 3072, nullptr, 1, nullptr, 0);
-    if (taskResult != pdPASS) {
-        MACPLUS_LOG("FATAL: cannot create emulation task\n");
+    // Arduino-ESP32's pinned-task wrapper takes the stack size in bytes.  The
+    // HD startup path enters FatFS and Flash-mapping code before the 68K loop;
+    // a 3 KiB stack trips its canary.  Put an 8 KiB stack in executable
+    // internal RAM, which is also data-addressable on ESP32-S3, so ordinary
+    // heap fragmentation from SD/display setup cannot prevent task creation.
+    const TaskHandle_t taskResult = emuTaskStack == nullptr
+        ? nullptr
+        : xTaskCreateStaticPinnedToCore(
+              emuTask, "emu", kEmuTaskStackBytes, nullptr, 1, emuTaskStack,
+              &emuTaskControl, 0);
+    if (taskResult == nullptr) {
+        MACPLUS_LOG("FATAL: cannot create emulation task (free=%u largest=%u internal=%u largest_internal=%u)\n",
+               static_cast<unsigned>(esp_get_free_heap_size()),
+               static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+               static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+               static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
     }
 }
 

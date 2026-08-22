@@ -6,6 +6,7 @@
 
 extern "C" {
 #include "tme/hd.h"
+#include "tme/snd.h"
 }
 
 namespace {
@@ -30,6 +31,7 @@ extern "C" int webInstallModeRequested() {
 
 extern "C" void requestWebInstallMode() {
     MACPLUS_LOG("WEB: rebooting into integrated transfer mode\n");
+    sndPrepareForRestart();
     hdFlushNow();
     setWebMode(true);
     delay(100);
@@ -38,6 +40,7 @@ extern "C" void requestWebInstallMode() {
 
 extern "C" void exitWebInstallMode() {
     MACPLUS_LOG("WEB: leaving transfer mode\n");
+    sndPrepareForRestart();
     setWebMode(false);
     delay(100);
     ESP.restart();

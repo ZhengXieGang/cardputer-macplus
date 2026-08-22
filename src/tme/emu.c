@@ -25,6 +25,7 @@
 #include "rtc.h"
 #include "ncr.h"
 #include "hd.h"
+#include "sdcard.h"
 #include "softfloppy.h"
 #include "snd.h"
 #include "mouse.h"
@@ -406,8 +407,36 @@ void tmeStartEmu(void *rom) {
 	// heap for SCC initialization, which causes an immediate abort/boot loop.
 	MACPLUS_LOG("Creating HD and registering it...\n");
 	ncrInit();
+	// The card can still be busy settling when the early board setup probes
+	// it. Retry once at the actual storage consumer so a transient probe miss
+	// does not make an existing /sd/hd.img look absent for the whole boot.
+	if (!sdcardMounted()) {
+		MACPLUS_LOG("HD: SD was not mounted during setup; retrying before open\n");
+		for (int attempt = 0; attempt < 2 && !sdcardMounted(); ++attempt) {
+			if (sdcardRetry()) break;
+			vTaskDelay(pdMS_TO_TICKS(50));
+		}
+	}
 	SCSIDevice *hd=hdCreate();
+	if (hd == NULL || !hdIsDeviceReady(hd)) {
+		// Do not reset the emulated CPU without a usable system disk.  The
+		// ROM would otherwise fall through to the question-mark floppy screen,
+		// which hides the actual storage problem from the user.
+		const char *lines[] = {
+			"BOOT CHECK FAILED",
+			"NO SYSTEM DISK",
+			"COPY /hd.img TO SD",
+		};
+		dispShowMessage(lines, 3);
+		emuRunning = 0;
+		MACPLUS_LOG("BOOT: hard disk unavailable; emulator not started\n");
+		return;
+	}
 	ncrRegisterDevice(6, hd);
+	// Keep the physical IWM state machine initialized even when the patched
+	// .Sony path handles the uploaded image through the PV hook.  Other ROM
+	// floppy paths still touch IWM registers during driver setup.
+	iwmInit();
 	softFloppyInit();
 	viaClear(VIA_PORTA, 0x7F);
 	viaSet(VIA_PORTA, 0x80);

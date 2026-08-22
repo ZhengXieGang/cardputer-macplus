@@ -12,10 +12,10 @@ namespace {
 
 constexpr size_t kSamplesPerFrame = 370;
 constexpr uint32_t kSampleRate = 22200;
-// M5Unified's master volume is an 8-bit value (0..255).  90 is approximately
-// 35% of full scale and is applied after begin(), when the board codec/I2S
-// configuration is finalized.
-constexpr uint8_t kSpeakerVolume = 90;
+// The setting exposed to the user is a percentage of the single mixer gain.
+// Keep this mapping linear so the value shown in the WiFi menu is the actual
+// master-volume percentage, rather than applying a second perceptual curve.
+constexpr uint8_t kSpeakerVolumePercent = 35;
 constexpr uint8_t kAudioChannel = 0;
 
 // Cardputer Adv audio path: ESP32-S3 I2S1 -> ES8311 -> NS4150B.
@@ -29,7 +29,11 @@ constexpr uint8_t kEs8311DacVolume0dB = 0xBF;
 uint8_t audioBuffers[3][kSamplesPerFrame];
 size_t nextBuffer = 0;
 bool speakerReady = false;
-uint8_t speakerVolume = kSpeakerVolume;
+uint8_t speakerVolumePercent = kSpeakerVolumePercent;
+
+static uint8_t percentToMasterVolume(uint8_t percent) {
+    return static_cast<uint16_t>(percent) * 255U / 100U;
+}
 
 static bool writeEs8311(uint8_t reg, uint8_t value) {
     if (!M5.In_I2C.isEnabled()) return false;
@@ -131,7 +135,9 @@ void sndInit() {
     }
     speakerReady = i2sReady && codecReady && outputReady;
     if (speakerReady) {
-        M5.Speaker.setVolume(speakerVolume);
+        // M5Unified owns the mixer gain. Keep one volume stage so the value
+        // saved by the WiFi menu is also the value heard from the speaker.
+        M5.Speaker.setVolume(percentToMasterVolume(speakerVolumePercent));
     } else {
         // Leave the digital mixer silent if either the codec or I2S failed.
         M5.Speaker.setVolume(0);
@@ -139,17 +145,47 @@ void sndInit() {
     MACPLUS_LOG("AUDIO: Cardputer speaker %s (%lu Hz, volume=%u, codec=%s)\n",
            speakerReady ? "ready" : "unavailable",
            static_cast<unsigned long>(kSampleRate),
-           static_cast<unsigned>(speakerVolume),
+           static_cast<unsigned>(speakerVolumePercent),
            (codecReady && outputReady) ? "ready" : "unavailable");
 }
 
-void sndSetVolume(uint8_t volume) {
-    speakerVolume = volume;
-    if (speakerReady) M5.Speaker.setVolume(volume);
+void sndSetVolume(uint8_t percent) {
+    if (percent < 1U) percent = 1U;
+    if (percent > 100U) percent = 100U;
+    speakerVolumePercent = percent;
+    if (speakerReady) {
+        M5.Speaker.setVolume(percentToMasterVolume(speakerVolumePercent));
+    }
 }
 
 uint8_t sndGetVolume(void) {
-    return speakerVolume;
+    return speakerVolumePercent;
+}
+
+void sndPrepareForRestart(void) {
+    // First stop software playback and force any queued mixer output to the
+    // zero-amplitude level. Give the speaker task enough time to drain the
+    // current DMA buffer before changing the codec power state.
+    if (speakerReady) {
+        M5.Speaker.setVolume(0);
+        M5.Speaker.stop();
+        delay(25);
+    }
+
+    // WiFi transfer mode intentionally does not call sndInit(), but M5 still
+    // initializes the shared I2C bus. Mute the ES8311 directly so a reset
+    // cannot leave the amplifier connected to a full-scale DAC output.
+    if (!M5.In_I2C.isEnabled()) return;
+    writeEs8311(0x31, kEs8311DacMute);
+    delay(2);
+    writeEs8311(0x32, 0x00);
+    writeEs8311(0x13, 0x00);
+    if (speakerReady) {
+        // Uninstall I2S only after the codec is muted. This prevents the
+        // final DMA/GPIO transition from reaching the amplifier.
+        M5.Speaker.end();
+        speakerReady = false;
+    }
 }
 
 int sndPush(uint8_t *data, int volume) {

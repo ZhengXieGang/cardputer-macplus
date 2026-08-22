@@ -51,13 +51,14 @@ static uint32_t uploadExpectedBytes = 0;
 static uint32_t uploadRequestBytes = 0;
 static uint32_t uploadInputOffset = 0;
 static bool uploadIsDc42 = false;
+static bool uploadNeedsPadding = false;
 static uint8_t dc42Header[84];
 static FILE *sdFile = nullptr;
 static bool accessPointReady = false;
 static bool accessPointAttempted = false;
 static uint32_t lastDisplayUpdateMs = 0;
 
-static const char INSTALL_PAGE_LEGACY[] PROGMEM = R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MacPlus Transfer</title><style>*{box-sizing:border-box}html,body{margin:0;min-height:100%;color:#111;background:#aaa;font:14px Geneva,Chicago,"Helvetica Neue",Arial,sans-serif;letter-spacing:0}button,input{font:inherit}.menu{height:30px;display:flex;align-items:center;gap:22px;padding:0 12px;background:#fff;border-bottom:2px solid #000}.menu b{font-size:16px}.menu .lang{margin-left:auto;font-size:12px}.desktop{min-height:calc(100vh - 30px);padding:5vh 16px}.window{width:min(640px,100%);margin:auto;background:#fff;border:2px solid #000;box-shadow:7px 7px 0 #555;animation:open .18s ease-out}.titlebar{height:31px;display:grid;grid-template-columns:28px 1fr 28px;align-items:center;border-bottom:2px solid #000;text-align:center}.titlebar h1{margin:0;font-size:14px}.close{width:15px;height:15px;margin:auto;border:2px solid #000}.body{padding:20px 22px}.intro{margin:0 0 16px;line-height:1.45}.online{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-weight:bold}.lamp{width:10px;height:10px;background:#111;border:1px solid #000}.disk{padding:17px 0;border-top:1px solid #000}.disk h2{margin:0 0 5px;font-size:17px}.disk p{margin:0 0 13px;color:#333}.actions{display:grid;grid-template-columns:auto minmax(100px,1fr) auto;gap:10px;align-items:center}.pick,.send{min-height:34px;padding:7px 13px;background:#fff;color:#000;border:2px solid #000;border-radius:0;box-shadow:2px 2px 0 #000;cursor:pointer}.pick input{position:absolute;width:1px;height:1px;opacity:0}.pick:active,.send:active{transform:translate(2px,2px);box-shadow:none}.send:disabled{color:#777;border-color:#777;box-shadow:2px 2px 0 #777;cursor:not-allowed}.filename{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.monitor{padding-top:17px;border-top:2px solid #000}.monitor-head{display:flex;justify-content:space-between;margin-bottom:8px}.bar{height:20px;padding:3px;border:2px solid #000;background:#fff}.bar span{display:block;width:0;height:100%;background:#111;transition:width .12s linear}.message{min-height:20px;margin:8px 0 0}.note{margin:15px 0 0;font-size:12px;color:#333}@media(max-width:520px){.desktop{padding:18px 10px}.body{padding:16px}.actions{grid-template-columns:1fr auto}.filename{grid-column:1/-1;grid-row:2}.pick,.send{width:100%}}@media(prefers-reduced-motion:reduce){.window{animation:none}.bar span{transition:none}}@keyframes open{from{transform:scale(.98);opacity:.45}to{transform:scale(1);opacity:1}}</style></head><body><header class="menu"><b>MacPlus</b><span data-t="menu">File Transfer</span><span class="lang" id="lang">English</span></header><main class="desktop"><section class="window" aria-labelledby="title"><header class="titlebar"><span class="close" aria-hidden="true"></span><h1 id="title" data-t="title">MacPlus Transfer</h1><span></span></header><div class="body"><p class="intro" data-t="intro">Upload software disks directly to this Cardputer.</p><div class="online"><span class="lamp"></span><span data-t="online">Connected to MacPlus-Install</span></div><form class="disk" action="/upload/hd" data-min="50688" data-max="0" data-step="512"><h2 data-t="hd">System Hard Disk</h2><p data-t="hdInfo">Reading available Flash capacity...</p><div class="actions"><label class="pick"><input type="file" name="hdimg" accept=".img"><span data-t="choose">Choose Image</span></label><span class="filename" data-t="none">No file selected</span><button class="send" type="submit" data-t="upload">Upload</button></div></form><form class="disk" action="/upload/install" data-sizes="409600,819200,409684,419284,819284,838484"><h2 data-t="install">Software Disk</h2><p data-t="installInfo">400K or 800K HFS/MFS image, raw or Disk Copy 4.2</p><div class="actions"><label class="pick"><input type="file" name="installimg" accept=".img,.dsk,.image,.dc42"><span data-t="choose">Choose Image</span></label><span class="filename" data-t="none">No file selected</span><button class="send" type="submit" data-t="upload">Upload</button></div></form><section class="monitor" aria-live="polite"><div class="monitor-head"><b data-t="status">Transfer Status</b><output id="percent">0%</output></div><div class="bar" id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="fill"></span></div><p class="message" id="message"></p></section><p class="note" data-t="note">The device verifies the image and restarts automatically after a successful upload.</p></div></section></main><script>const T={en:{menu:"File Transfer",title:"MacPlus Transfer",intro:"Upload disk images directly to this Cardputer.",online:"Connected to MacPlus-Install",hd:"System Hard Disk",hdInfo:"Macintosh partition image, 512-byte aligned, up to {max} bytes on this device",install:"Software Disk",installInfo:"400K or 800K HFS/MFS image, raw or Disk Copy 4.2",choose:"Choose Image",none:"No file selected",upload:"Upload",status:"Transfer Status",note:"After a software-disk upload, open its Finder icon and copy the app to the system disk.",ready:"Ready.",badHd:"Invalid hard disk image size. Use 512-byte alignment from {min} to {max} bytes.",badInstall:"Software disk must be 400K (409,600) or 800K (819,200), raw or Disk Copy 4.2.",prepare:"Preparing storage...",sending:"Uploading {name}: {percent}%",verify:"Upload sent. Verifying...",done:"Complete. Restarting MacPlus...",fail:"Upload failed. Check the image and try again."},zh:{menu:"文件传输",title:"MacPlus 传输工具",intro:"把磁盘镜像直接上传到这台 Cardputer。",online:"已连接 MacPlus-Install",hd:"系统硬盘",hdInfo:"Macintosh 分区硬盘镜像，512 字节对齐；本机最大 {max} 字节",install:"软件安装盘",installInfo:"支持 400K 或 800K HFS/MFS 原始镜像或 Disk Copy 4.2 文件",choose:"选择镜像",none:"未选择文件",upload:"上传",status:"传输状态",note:"上传软件盘后，在 Finder 打开新磁盘图标，把应用复制到系统硬盘。",ready:"准备就绪。",badHd:"系统硬盘镜像大小无效，须为 512 字节对齐，范围 {min} 至 {max} 字节。",badInstall:"软件盘必须是 400K（409,600 字节）或 800K（819,200 字节），支持原始镜像或 Disk Copy 4.2。",prepare:"正在准备存储空间...",sending:"正在上传 {name}：{percent}%",verify:"上传完成，正在校验...",done:"写入完成，正在重启 MacPlus...",fail:"上传失败，请检查镜像后重试。"}};const lang=(navigator.language||"").toLowerCase().startsWith("zh")?"zh":"en",t=T[lang],q=s=>document.querySelector(s),all=s=>[...document.querySelectorAll(s)];document.documentElement.lang=lang==="zh"?"zh-CN":"en";q("#lang").textContent=lang==="zh"?"简体中文":"English";all("[data-t]").forEach(e=>e.textContent=t[e.dataset.t]);const bar=q("#bar"),fill=q("#fill"),pct=q("#percent"),message=q("#message"),forms=all("form.disk");function setProgress(value,text){value=Math.max(0,Math.min(100,value));fill.style.width=value+"%";pct.textContent=value+"%";bar.setAttribute("aria-valuenow",value);message.textContent=text}function enableForms(on){forms.forEach(f=>f.querySelector(".send").disabled=!on||!f.dataset.valid)}setProgress(0,t.ready);forms.forEach(form=>{const input=form.querySelector("input"),name=form.querySelector(".filename"),button=form.querySelector(".send"),sizes=(form.dataset.sizes||"").split(",").filter(Boolean).map(Number),min=Number(form.dataset.min||0),step=Number(form.dataset.step||1);let max=Number(form.dataset.max||0);const valid=file=>!!file&&(sizes.length?sizes.includes(file.size):max>0&&file.size>=min&&file.size<=max&&file.size%step===0),bad=()=>sizes.length?t.badInstall:t.badHd.replace("{min}",min.toLocaleString()).replace("{max}",max.toLocaleString());form.dataset.valid="";button.disabled=true;if(!sizes.length)fetch("/info").then(r=>r.json()).then(info=>{max=Number(info.hdMax||0);form.dataset.max=max;form.querySelector("p").textContent=t.hdInfo.replace("{max}",max.toLocaleString());input.dispatchEvent(new Event("change"))});input.addEventListener("change",()=>{const file=input.files[0],ok=valid(file);name.textContent=file?file.name:t.none;form.dataset.valid=ok?"1":"";button.disabled=!ok;setProgress(0,file&&!ok?bad():t.ready)});form.addEventListener("submit",event=>{event.preventDefault();const file=input.files[0];if(!valid(file))return;enableForms(false);setProgress(0,t.prepare);const xhr=new XMLHttpRequest();xhr.open("POST",form.action);xhr.setRequestHeader("Content-Type","application/octet-stream");xhr.upload.onprogress=e=>{if(!e.lengthComputable)return;const p=Math.round(e.loaded*100/e.total);setProgress(p,t.sending.replace("{name}",file.name).replace("{percent}",p))};xhr.upload.onload=()=>setProgress(100,t.verify);xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300)setProgress(100,t.done);else{setProgress(0,t.fail);enableForms(true)}};xhr.onerror=()=>{setProgress(0,t.fail);enableForms(true)};xhr.send(file)})});</script></body></html>)HTML";
+static const char INSTALL_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MacPlus Transfer</title><style>*{box-sizing:border-box}html,body{margin:0;min-height:100%;color:#111;background:#aaa;font:14px Geneva,Chicago,"Helvetica Neue",Arial,sans-serif;letter-spacing:0}button,input{font:inherit}.desktop{min-height:100vh;padding:5vh 16px}.window{width:min(640px,100%);margin:auto;background:#fff;border:2px solid #000;box-shadow:7px 7px 0 #555;animation:open .18s ease-out}.titlebar{height:31px;display:grid;grid-template-columns:28px 1fr 28px;align-items:center;border-bottom:2px solid #000;text-align:center}.titlebar h1{margin:0;font-size:14px}.close{width:15px;height:15px;margin:auto;border:2px solid #000}.body{padding:20px 22px}.disk{padding:17px 0;border-top:1px solid #000}.disk h2{margin:0 0 5px;font-size:17px}.disk p{margin:0 0 13px;color:#333}.actions{display:grid;grid-template-columns:auto minmax(100px,1fr) auto;gap:10px;align-items:center}.pick,.send{min-height:34px;padding:7px 13px;background:#fff;color:#000;border:2px solid #000;border-radius:0;box-shadow:2px 2px 0 #000;cursor:pointer}.pick input{position:absolute;width:1px;height:1px;opacity:0}.pick:active,.send:active{transform:translate(2px,2px);box-shadow:none}.send:disabled{color:#777;border-color:#777;box-shadow:2px 2px 0 #777;cursor:not-allowed}.filename{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.monitor{padding-top:17px;border-top:2px solid #000}.monitor-head{display:flex;justify-content:space-between;margin-bottom:8px}.bar{height:20px;padding:3px;border:2px solid #000;background:#fff}.bar span{display:block;width:0;height:100%;background:#111;transition:width .12s linear}.message{min-height:20px;margin:8px 0 0}@media(max-width:520px){.desktop{padding:18px 10px}.body{padding:16px}.actions{grid-template-columns:1fr auto}.filename{grid-column:1/-1;grid-row:2}.pick,.send{width:100%}}@media(prefers-reduced-motion:reduce){.window{animation:none}.bar span{transition:none}}@keyframes open{from{transform:scale(.98);opacity:.45}to{transform:scale(1);opacity:1}}</style></head><body><main class="desktop"><section class="window" aria-labelledby="title"><header class="titlebar"><span class="close" aria-hidden="true"></span><h1 id="title" data-t="title">MacPlus Transfer</h1><span></span></header><div class="body"><form class="disk" action="/upload/hd" data-min="50688" data-max="0" data-step="512"><h2 data-t="hd">System Hard Disk</h2><p data-t="hdInfo">Reading available Flash capacity...</p><div class="actions"><label class="pick"><input type="file" name="hdimg" accept=".img"><span data-t="choose">Choose Image</span></label><span class="filename" data-t="none">No file selected</span><button class="send" type="submit" data-t="upload">Upload</button></div></form><form class="disk" action="/upload/install" data-min="2048" data-max="819200" data-step="512"><h2 data-t="install">Software Disk</h2><p data-t="installInfo">HFS/MFS volume, compact or 400K/800K raw image, or Disk Copy 4.2</p><div class="actions"><label class="pick"><input type="file" name="installimg" accept=".img,.dsk,.image,.dc42"><span data-t="choose">Choose Image</span></label><span class="filename" data-t="none">No file selected</span><button class="send" type="submit" data-t="upload">Upload</button></div></form><section class="monitor" aria-live="polite"><div class="monitor-head"><b data-t="status">Transfer Status</b><output id="percent">0%</output></div><div class="bar" id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="fill"></span></div><p class="message" id="message"></p></section></div></section></main><script>const T={en:{title:"MacPlus Transfer",hd:"System Hard Disk",hdInfo:"Macintosh partition image, 512-byte aligned, up to {max} bytes on this device",install:"Software Disk",installInfo:"HFS/MFS volume, compact or 400K/800K raw image, or Disk Copy 4.2",choose:"Choose Image",none:"No file selected",upload:"Upload",status:"Transfer Status",ready:"Ready.",badHd:"Invalid hard disk image size. Use 512-byte alignment from {min} to {max} bytes.",badInstall:"Software disk must be a valid HFS/MFS volume up to 800K, a 400K/800K raw image, or Disk Copy 4.2.",prepare:"Preparing storage...",sending:"Uploading {name}: {percent}%",verify:"Upload sent. Verifying...",done:"Complete. Restarting MacPlus...",fail:"Upload failed. Check the image and try again."},zh:{title:"MacPlus 传输工具",hd:"系统硬盘",hdInfo:"Macintosh 分区硬盘镜像，512 字节对齐；本机最大 {max} 字节",install:"软件安装盘",installInfo:"支持紧凑 HFS/MFS 卷、400K/800K 原始镜像或 Disk Copy 4.2 文件",choose:"选择镜像",none:"未选择文件",upload:"上传",status:"传输状态",ready:"准备就绪。",badHd:"系统硬盘镜像大小无效，须为 512 字节对齐，范围 {min} 至 {max} 字节。",badInstall:"软件盘必须是有效的 HFS/MFS 卷（最大 800K）、400K/800K 原始镜像或 Disk Copy 4.2。",prepare:"正在准备存储空间...",sending:"正在上传 {name}：{percent}%",verify:"上传完成，正在校验...",done:"写入完成，正在重启 MacPlus...",fail:"上传失败，请检查镜像后重试。"}};const lang=(navigator.language||"").toLowerCase().startsWith("zh")?"zh":"en",t=T[lang],q=s=>document.querySelector(s),all=s=>[...document.querySelectorAll(s)];document.documentElement.lang=lang==="zh"?"zh-CN":"en";all("[data-t]").forEach(e=>e.textContent=t[e.dataset.t]);const bar=q("#bar"),fill=q("#fill"),pct=q("#percent"),message=q("#message"),forms=all("form.disk");function setProgress(value,text){value=Math.max(0,Math.min(100,value));fill.style.width=value+"%";pct.textContent=value+"%";bar.setAttribute("aria-valuenow",value);message.textContent=text}function enableForms(on){forms.forEach(f=>f.querySelector(".send").disabled=!on||!f.dataset.valid)}setProgress(0,t.ready);forms.forEach(form=>{const input=form.querySelector("input"),name=form.querySelector(".filename"),button=form.querySelector(".send"),sizes=(form.dataset.sizes||"").split(",").filter(Boolean).map(Number),min=Number(form.dataset.min||0),step=Number(form.dataset.step||1);let max=Number(form.dataset.max||0);const valid=file=>!!file&&(sizes.length?sizes.includes(file.size):max>0&&file.size>=min&&file.size<=max&&file.size%step===0),bad=()=>sizes.length?t.badInstall:t.badHd.replace("{min}",min.toLocaleString()).replace("{max}",max.toLocaleString());form.dataset.valid="";button.disabled=true;if(!sizes.length)fetch("/info").then(r=>r.json()).then(info=>{max=Number(info.hdMax||0);form.dataset.max=max;form.querySelector("p").textContent=t.hdInfo.replace("{max}",max.toLocaleString());input.dispatchEvent(new Event("change"))});input.addEventListener("change",()=>{const file=input.files[0],ok=valid(file);name.textContent=file?file.name:t.none;form.dataset.valid=ok?"1":"";button.disabled=!ok;setProgress(0,file&&!ok?bad():t.ready)});form.addEventListener("submit",event=>{event.preventDefault();const file=input.files[0];if(!valid(file))return;enableForms(false);setProgress(0,t.prepare);const xhr=new XMLHttpRequest();xhr.open("POST",form.action);xhr.setRequestHeader("Content-Type","application/octet-stream");xhr.upload.onprogress=e=>{if(!e.lengthComputable)return;const p=Math.round(e.loaded*100/e.total);setProgress(p,t.sending.replace("{name}",file.name).replace("{percent}",p))};xhr.upload.onload=()=>setProgress(100,t.verify);xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300)setProgress(100,t.done);else{setProgress(0,t.fail);enableForms(true)}};xhr.onerror=()=>{setProgress(0,t.fail);enableForms(true)};xhr.send(file)})});</script></body></html>)HTML";
 static uint32_t webCrc32(const uint8_t *data, size_t len, uint32_t crc) {
     crc = ~crc;
     while (len--) {
@@ -67,6 +68,13 @@ static uint32_t webCrc32(const uint8_t *data, size_t len, uint32_t crc) {
         }
     }
     return ~crc;
+}
+
+static bool isDc42RequestSize(uint32_t bytes) {
+    return bytes == INSTALL_400K_BYTES + 84U ||
+           bytes == INSTALL_400K_BYTES + 84U + 800U * 12U ||
+           bytes == INSTALL_800K_BYTES + 84U ||
+           bytes == INSTALL_800K_BYTES + 84U + 1600U * 12U;
 }
 
 static uint32_t installVolumeBytesForUpload(uint32_t bytes) {
@@ -79,6 +87,19 @@ static uint32_t installVolumeBytesForUpload(uint32_t bytes) {
     }
     if (bytes == INSTALL_800K_BYTES + 84U ||
         bytes == INSTALL_800K_BYTES + 84U + 1600U * 12U) {
+        return INSTALL_800K_BYTES;
+    }
+    // Some valid HFS/MFS software disks are volume-only images containing
+    // only the used portion of a 400K/800K floppy. They are still usable as
+    // floppy media once the unused tail is zero-filled to the nearest Sony
+    // disk geometry. Keep the lower bound large enough to include a volume
+    // header and catalog while rejecting arbitrary tiny uploads.
+    if (bytes >= 2048U && bytes <= INSTALL_400K_BYTES &&
+        (bytes % 512U) == 0) {
+        return INSTALL_400K_BYTES;
+    }
+    if (bytes > INSTALL_400K_BYTES && bytes <= INSTALL_800K_BYTES &&
+        (bytes % 512U) == 0) {
         return INSTALL_800K_BYTES;
     }
     return 0;
@@ -132,14 +153,13 @@ static WifiMenuItem wifiMenuItem = WifiMenuItem::Sensitivity;
 static char wifiMenuStatus[40] = "[RUN] STARTING AP";
 
 static uint8_t wifiVolumePercent(void) {
-    return static_cast<uint8_t>((static_cast<unsigned>(sndGetVolume()) * 100U +
-                                 127U) / 255U);
+    return sndGetVolume();
 }
 
 static bool saveWifiSettings(uint16_t pointerSpeedPercent, uint8_t percent) {
-    const uint8_t volume = static_cast<uint8_t>(
-        (static_cast<unsigned>(percent) * 255U + 50U) / 100U);
-    return saveMacSettings(pointerSpeedPercent, volume);
+    if (percent < 1U) percent = 1U;
+    if (percent > 100U) percent = 100U;
+    return saveMacSettings(pointerSpeedPercent, percent);
 }
 
 static void renderWifiMenu(void) {
@@ -150,7 +170,7 @@ static void renderWifiMenu(void) {
     snprintf(speed, sizeof(speed), "%c POINTER SPEED %u%%",
              wifiMenuItem == WifiMenuItem::Sensitivity ? '>' : ' ',
              static_cast<unsigned>(imuPointerSpeedPercent));
-    snprintf(volume, sizeof(volume), "%c VOLUME (SPEAKER) %u%%",
+    snprintf(volume, sizeof(volume), "%c SPEAKER VOLUME %u%%",
              wifiMenuItem == WifiMenuItem::Volume ? '>' : ' ',
              static_cast<unsigned>(wifiVolumePercent()));
     snprintf(clearHd, sizeof(clearHd), "%c CLEAR FLASH DISK CACHE",
@@ -198,7 +218,7 @@ static void adjustWifiMenu(int direction) {
         }
     } else if (wifiMenuItem == WifiMenuItem::Volume) {
         int value = static_cast<int>(wifiVolumePercent()) + direction * 5;
-        if (value < 0) value = 0;
+        if (value < 1) value = 1;
         if (value > 100) value = 100;
         if (saveWifiSettings(imuPointerSpeedPercent,
                              static_cast<uint8_t>(value))) {
@@ -365,7 +385,7 @@ static bool commitInstallDisk() {
 }
 
 static void handleRoot() {
-    webServer->send_P(200, "text/html; charset=utf-8", INSTALL_PAGE_LEGACY);
+    webServer->send_P(200, "text/html; charset=utf-8", INSTALL_PAGE);
 }
 
 static void handleInfo() {
@@ -407,6 +427,7 @@ static void handleRawUpload(UploadTarget target) {
         uploadRequestBytes = 0;
         uploadInputOffset = 0;
         uploadIsDc42 = false;
+        uploadNeedsPadding = false;
 
         const long requestLength = webServer->header("Content-Length").toInt();
         const uint32_t requestBytes = requestLength > 0 &&
@@ -429,7 +450,15 @@ static void handleRawUpload(UploadTarget target) {
                                   ? requestBytes
                                   : installVolumeBytesForUpload(requestBytes);
         uploadIsDc42 = target == UploadTarget::InstallDisk &&
-                       requestBytes != uploadExpectedBytes;
+                       isDc42RequestSize(requestBytes);
+        uploadNeedsPadding = target == UploadTarget::InstallDisk &&
+                             !uploadIsDc42 &&
+                             requestBytes != uploadExpectedBytes;
+        if (uploadNeedsPadding) {
+            MACPLUS_LOG("WEB: compact software disk %lu -> %lu bytes\n",
+                   static_cast<unsigned long>(requestBytes),
+                   static_cast<unsigned long>(uploadExpectedBytes));
+        }
         if (uploadTarget == UploadTarget::InstallDisk) {
             if (!sdcardMounted()) sdcardInit();
             if (sdcardMounted()) {
@@ -533,7 +562,27 @@ static void handleRawUpload(UploadTarget target) {
         }
     } else if (upload.status == RAW_END) {
         const uint32_t maxBytes = uploadExpectedBytes;
-        if (!closeSdFile()) uploadError = true;
+        // Keep the staging file open while extending a compact volume with
+        // zero-filled sectors. The normal path closes it before validation;
+        // the padding path must append first and close afterwards.
+        if (!uploadNeedsPadding && !closeSdFile()) uploadError = true;
+        if (!uploadError && uploadNeedsPadding &&
+            uploadInputOffset == uploadRequestBytes &&
+            uploadOffset < maxBytes) {
+            static const uint8_t zeroBlock[512] = {};
+            while (!uploadError && uploadOffset < maxBytes) {
+                const uint32_t remaining = maxBytes - uploadOffset;
+                const size_t count = remaining < sizeof(zeroBlock)
+                    ? remaining : sizeof(zeroBlock);
+                if (sdFile == nullptr ||
+                    fwrite(zeroBlock, 1, count, sdFile) != count) {
+                    uploadError = true;
+                    break;
+                }
+                uploadOffset += static_cast<uint32_t>(count);
+            }
+            if (!closeSdFile()) uploadError = true;
+        }
         const bool complete = !uploadError && uploadTarget == target &&
                               uploadInputOffset == uploadRequestBytes &&
                               uploadOffset == maxBytes;

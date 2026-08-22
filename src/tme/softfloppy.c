@@ -25,12 +25,15 @@ enum {
     kParamErr = -50,
     kNoSuchDriveErr = -56,
     kOfflineErr = -65,
+    kReadErr = -19,
+    kWriteErr = -20,
     kWriteProtectedErr = -44,
 
     kSonyRefNum = -5,
     kDriveNumber = 1,
 
     kIoTrap = 6,
+    kIoResult = 16,
     kIoVRefNum = 22,
     kIoBuffer = 32,
     kIoReqCount = 36,
@@ -49,10 +52,13 @@ enum {
     kDsQDrive = 12,
     kDsQRefNum = 14,
     kDsTwoSideFormat = 18,
+    kDsNewInterface = 19,
+    kDsDriveErrors = 20,
     kDsMfmDrive = 22,
     kDsMfmDisk = 23,
 
     kReadCommand = 2,
+    kWriteCommand = 3,
 };
 
 typedef struct {
@@ -130,6 +136,34 @@ static int16_t setDiskError(int16_t error) {
     return error;
 }
 
+/* Device Manager consumes ioResult from the request parameter block. DskErr is
+   kept as the driver's global completion status for older System code. */
+static int16_t finishIo(uint32_t parameterBlock, int16_t result) {
+    ramWrite16(parameterBlock + kIoResult, (uint16_t)result);
+    return setDiskError(result);
+}
+
+static int16_t finishPrime(uint32_t parameterBlock, uint32_t dce,
+                           int16_t result, uint32_t actual,
+                           uint32_t nextPosition) {
+    /* The Device Manager normally copies D0 into ioResult, but the patched
+       Sony stub has both synchronous and queued return paths.  Mature Sony
+       implementations write the request result explicitly so a queued
+       completion cannot reuse an older error from the same ParamBlock. */
+    ramWrite16(parameterBlock + kIoResult, (uint16_t)result);
+    ramWrite32(parameterBlock + kIoActCount, actual);
+    if (result == kNoErr) {
+        ramWrite32(dce + kDCtlPosition, nextPosition);
+    }
+    /* DskErr is the driver's global completion status, not just an error
+       latch. Device Manager and older File Manager code consult it after a
+       sequence of requests, so a startup offLinErr must not survive the first
+       successful read/write. Basilisk and Mini vMac update it on every Prime
+       completion. */
+    setDiskError(result);
+    return result;
+}
+
 static int driveMatches(uint32_t parameterBlock) {
     return (int16_t)ramRead16(parameterBlock + kIoVRefNum) == kDriveNumber;
 }
@@ -140,13 +174,18 @@ static void setDriveStatus(void) {
     ramWrite8(floppy.status + kDsWriteProtected, floppy.readOnly ? 0xFFU : 0U);
     ramWrite8(floppy.status + kDsDiskInPlace, floppy.available ? 1U : 0U);
     ramWrite8(floppy.status + kDsInstalled, 1U);
-    ramWrite8(floppy.status + kDsSides,
-              floppy.bytes == 800U * 1024U ? 0xFFU : 0U);
+    /* UMAC/Basilisk expose the virtual drive as a Sony double-sided drive for
+       both 400K and 800K images.  The image's actual length is enforced by
+       Prime; advertising a single-sided 400K drive makes Finder choose a
+       different legacy path and breaks file copies from MFS disks. */
+    ramWrite8(floppy.status + kDsSides, 0xFFU);
     ramWrite16(floppy.status + kDsQType, 0U);
     ramWrite16(floppy.status + kDsQDrive, kDriveNumber);
     ramWrite16(floppy.status + kDsQRefNum, (uint16_t)kSonyRefNum);
-    ramWrite8(floppy.status + kDsTwoSideFormat,
-              floppy.bytes == 800U * 1024U ? 0xFFU : 0U);
+    ramWrite8(floppy.status + kDsTwoSideFormat, 0xFFU);
+    /* This is a GCR Sony drive, not a SuperDrive/MFM device. */
+    ramWrite8(floppy.status + kDsNewInterface, 0U);
+    ramWrite16(floppy.status + kDsDriveErrors, 0U);
     ramWrite8(floppy.status + kDsMfmDrive, 0U);
     ramWrite8(floppy.status + kDsMfmDisk, 0U);
 }
@@ -165,10 +204,20 @@ static int16_t softOpen(uint32_t dce, uint32_t status) {
     return setDiskError(kNoErr);
 }
 
+static void clearTagBuffer(void) {
+    /* Raw 400K/800K images do not carry the 12-byte Sony tag stream. */
+    ramWrite32(0x2FCU, 0U);
+    ramWrite32(0x300U, 0U);
+    ramWrite32(0x304U, 0U);
+}
+
 static int16_t softPrime(uint32_t parameterBlock, uint32_t dce) {
+    const uint32_t mark = ramRead32(dce + kDCtlPosition);
     ramWrite32(parameterBlock + kIoActCount, 0U);
-    if (!driveMatches(parameterBlock)) return setDiskError(kNoSuchDriveErr);
-    if (!floppy.available) return setDiskError(kOfflineErr);
+    if (!driveMatches(parameterBlock))
+        return finishPrime(parameterBlock, dce, kNoSuchDriveErr, 0U, mark);
+    if (!floppy.available)
+        return finishPrime(parameterBlock, dce, kOfflineErr, 0U, mark);
 
     /* Match the Sony/Basilisk driver: a successful request marks the disk as
        accessed before the actual transfer starts. */
@@ -176,58 +225,81 @@ static int16_t softPrime(uint32_t parameterBlock, uint32_t dce) {
 
     const uint32_t buffer = ramRead32(parameterBlock + kIoBuffer) & 0x00FFFFFFU;
     const uint32_t bytes = ramRead32(parameterBlock + kIoReqCount);
-    const uint32_t offset = ramRead32(dce + kDCtlPosition);
+    const uint16_t ioTrap = ramRead16(parameterBlock + kIoTrap);
+    const uint8_t command = (uint8_t)(ioTrap & 0xFFU);
+    /* Technote FL 24: Device Manager resolves ioPosMode/ioPosOffset for
+       devices and leaves the absolute byte position in dCtlPosition.  The
+       established Sony backends therefore use dCtlPosition directly. */
+    const uint32_t offset = mark;
     MACPLUS_LOG("SONY: prime req trap=%02X pos=%lu bytes=%lu buffer=%06lX\n",
-           (unsigned)(ramRead16(parameterBlock + kIoTrap) & 0xFFU),
+           (unsigned)command,
            (unsigned long)offset, (unsigned long)bytes,
            (unsigned long)buffer);
+
     if ((offset & 511U) != 0U || (bytes & 511U) != 0U ||
         offset > floppy.bytes || bytes > floppy.bytes - offset) {
         MACPLUS_LOG("SONY: prime reject drive=%d pos=%lu bytes=%lu buffer=%06lX\n",
                (int16_t)ramRead16(parameterBlock + kIoVRefNum),
                (unsigned long)offset, (unsigned long)bytes,
                (unsigned long)buffer);
-        return setDiskError(kParamErr);
+        return finishPrime(parameterBlock, dce, kParamErr, 0U, mark);
+    }
+    if (command != kReadCommand && command != kWriteCommand) {
+        MACPLUS_LOG("SONY: unsupported prime trap=%04X\n", (unsigned)ioTrap);
+        return finishPrime(parameterBlock, dce, kControlErr, 0U, mark);
     }
 
-    if ((ramRead16(parameterBlock + kIoTrap) & 0xFFU) == kReadCommand) {
-        uint8_t sector[512];
+    /* A zero-length Prime is a valid no-op, including at end of media. */
+    if (bytes == 0U)
+        return finishPrime(parameterBlock, dce, kNoErr, 0U, mark);
+
+    if (command == kReadCommand) {
         uint32_t position = offset;
         uint32_t remaining = bytes;
         uint32_t destination = buffer;
         while (remaining != 0U) {
-            if (!hdReadInstallBytes(position, sector, sizeof(sector))) {
-                MACPLUS_LOG("SONY: prime read failed pos=%lu sector=%lu\n",
-                       (unsigned long)position,
-                       (unsigned long)(position / 512U));
-                return setDiskError(kOfflineErr);
+            uint32_t chunk = remaining > 8192U ? 8192U : remaining;
+            const uint32_t ramPosition = ramOffset(destination);
+            const uint32_t contiguous = TME_RAMSIZE - ramPosition;
+            if (chunk > contiguous) chunk = contiguous;
+            chunk &= ~511U;
+            if (chunk == 0U ||
+                !hdReadInstallBytes(position, macRam + ramPosition, chunk)) {
+                MACPLUS_LOG("SONY: prime read failed pos=%lu bytes=%lu\n",
+                       (unsigned long)position, (unsigned long)remaining);
+                return finishPrime(parameterBlock, dce, kReadErr, 0U, mark);
             }
-            ramCopyTo(destination, sector, sizeof(sector));
-            position += sizeof(sector);
-            destination += sizeof(sector);
-            remaining -= sizeof(sector);
+            position += chunk;
+            destination += chunk;
+            remaining -= chunk;
         }
     } else {
-        if (floppy.readOnly) return setDiskError(kWriteProtectedErr);
+        if (floppy.readOnly)
+            return finishPrime(parameterBlock, dce, kWriteProtectedErr, 0U,
+                               mark);
         uint8_t sector[512];
         uint32_t position = offset;
         uint32_t remaining = bytes;
         uint32_t source = buffer;
         while (remaining != 0U) {
             ramCopyFrom(sector, source, sizeof(sector));
-            if (!hdWriteInstallBytes(position, sector, sizeof(sector))) {
-                return setDiskError(kOfflineErr);
-            }
+            if (!hdWriteInstallBytes(position, sector, sizeof(sector)))
+                return finishPrime(parameterBlock, dce, kWriteErr, 0U, mark);
             position += sizeof(sector);
             source += sizeof(sector);
             remaining -= sizeof(sector);
         }
-        if (!hdFlushInstallVolume()) return setDiskError(kOfflineErr);
+        if (!hdFlushInstallVolume())
+            return finishPrime(parameterBlock, dce, kWriteErr, 0U, mark);
     }
 
-    ramWrite32(parameterBlock + kIoActCount, bytes);
-    ramWrite32(dce + kDCtlPosition, offset + bytes);
-    return setDiskError(kNoErr);
+    /* Raw 400K/800K images do not carry Sony tag data.  The classic
+       Basilisk driver clears the ROM's shared TagBuf after every successful
+       read; leaving stale values here makes File Manager reject later
+       resource-fork reads (MacWrite reports this as ID 26). */
+    if (command == kReadCommand) clearTagBuffer();
+
+    return finishPrime(parameterBlock, dce, kNoErr, bytes, offset + bytes);
 }
 
 static int16_t softControl(uint32_t parameterBlock) {
@@ -239,81 +311,111 @@ static int16_t softControl(uint32_t parameterBlock) {
            (unsigned long)floppy.status);
 
     /* General driver controls from the mature Basilisk implementation. */
-    if (code == 1U) return setDiskError(-1); /* KillIO is unsupported. */
-    if (code == 9U) return setDiskError(kNoErr); /* Ignore track cache. */
+    if (code == 1U) return finishIo(parameterBlock, -1); /* KillIO unsupported. */
+    if (code == 9U) return finishIo(parameterBlock, kNoErr); /* Ignore cache. */
     if (code == 65U) {
         /* Basilisk mounts removable media by calling PostEvent(diskEvent)
            from the driver's periodic accRun callback. Return a one-shot
            positive signal; the 68K ROM stub performs that trap in the normal
            Mac execution context and disables further periodic callbacks. */
-        if (!floppy.mountPending) return setDiskError(kNoErr);
+        if (!floppy.mountPending) return finishIo(parameterBlock, kNoErr);
         /* Do not advertise an uploaded software disk during the ROM boot
            scan.  A non-bootable tools disk would otherwise win over the
            system hard disk and leave the Mac on the crossed-disk screen.
            softFloppyFrameTick() releases the media after ten real emulated
            seconds, once Finder has finished its boot-time drive scan. */
-        if (floppy.mountDelayFrames != 0U) return setDiskError(kNoErr);
+        if (floppy.mountDelayFrames != 0U)
+            return finishIo(parameterBlock, kNoErr);
         floppy.available = 1U;
         setDriveStatus();
         floppy.mountPending = 0U;
-        return setDiskError(1);
+        /* The positive return value is an internal signal consumed by the
+           patched 68K accRun stub to post diskEvent. The Control request
+           itself still completed successfully, so ioResult/DskErr must be 0. */
+        ramWrite16(parameterBlock + kIoResult, (uint16_t)kNoErr);
+        setDiskError(kNoErr);
+        return 1;
     }
-    if (!driveMatches(parameterBlock)) return setDiskError(kNoSuchDriveErr);
+    if (!driveMatches(parameterBlock))
+        return finishIo(parameterBlock, kNoSuchDriveErr);
 
     switch (code) {
     case 5: /* verify */
-        return setDiskError(floppy.available ? kNoErr : kOfflineErr);
+        return finishIo(parameterBlock, floppy.available ? kNoErr : kOfflineErr);
     case 6: /* format */
-        /* Uploaded media is already formatted.  A no-op is the behavior used
-           by Basilisk for a writable mounted volume; never erase the SD file. */
-        return setDiskError(floppy.readOnly ? kWriteProtectedErr : kNoErr);
+        /* Match Basilisk/UMAC: a writable inserted image accepts the format
+           control call.  The backend does not erase the image here because
+           uploaded images are already formatted. */
+        return finishIo(parameterBlock, floppy.readOnly ? kWriteProtectedErr :
+                        (floppy.available ? kNoErr : kOfflineErr));
     case 7: /* eject */
         /* There is no physical eject mechanism: the uploaded image remains
            mounted on SD until the next upload/reboot.  Treat the request as
            idempotent so System's boot-time cleanup cannot turn the drive
            offline and make the following Prime fail with -65. */
         setDriveStatus();
-        return setDiskError(kNoErr);
+        return finishIo(parameterBlock, kNoErr);
     case 8: /* tag buffer, unused by raw 400K/800K images */
+        return finishIo(parameterBlock, kNoErr);
     case 23: /* drive information */
-        return setDiskError(kNoErr);
+        /* Basilisk/UMAC return the physical drive class here.  The ROM and
+           File Manager use this value when choosing the Sony data path. */
+        ramWrite32(parameterBlock + kCsParam,
+                   kDriveNumber == 1 ? 0x00000004U : 0x00000104U);
+        return finishIo(parameterBlock, kNoErr);
+    case 0x5343U: { /* format-and-write, used by Disk Copy */
+        if (!floppy.available) return finishIo(parameterBlock, kOfflineErr);
+        if (floppy.readOnly)
+            return finishIo(parameterBlock, kWriteProtectedErr);
+        const uint32_t source = ramRead32(parameterBlock + kCsParam + 2U) &
+                                0x00FFFFFFU;
+        uint8_t sector[512];
+        for (uint32_t offset = 0; offset < floppy.bytes; offset += sizeof(sector)) {
+            ramCopyFrom(sector, source + offset, sizeof(sector));
+            if (!hdWriteInstallBytes(offset, sector, sizeof(sector)))
+                return finishIo(parameterBlock, kWriteErr);
+        }
+        if (!hdFlushInstallVolume())
+            return finishIo(parameterBlock, kWriteErr);
+        return finishIo(parameterBlock, kNoErr);
+    }
     default:
-        return setDiskError(kControlErr);
+        return finishIo(parameterBlock, kControlErr);
     }
 }
 
 static int16_t softStatus(uint32_t parameterBlock) {
     const uint16_t code = ramRead16(parameterBlock + kCsCode);
-    if (!driveMatches(parameterBlock)) return setDiskError(kNoSuchDriveErr);
+    if (!driveMatches(parameterBlock))
+        return finishIo(parameterBlock, kNoSuchDriveErr);
 
     switch (code) {
     case 6: { /* supported disk formats */
         const uint16_t count = ramRead16(parameterBlock + kCsParam);
-        if (count == 0U) return setDiskError(kParamErr);
+        if (count == 0U) return finishIo(parameterBlock, kParamErr);
         const uint32_t result = ramRead32(parameterBlock + kCsParam + 2U);
         ramWrite16(parameterBlock + kCsParam, 1U);
-        ramWrite32(result, floppy.bytes / 512U);
-        /* Basilisk II's Sony driver advertises DD, 2 heads, 18 sectors and
-           80 tracks as 0xD2120050.  The old 0xC2 value makes System reject an
-           otherwise valid 800K HFS image and ask to initialize it. */
-        ramWrite32(result + 4U, floppy.bytes == 800U * 1024U ?
-                   0xD2120050U : 0xC1110050U);
-        return setDiskError(kNoErr);
+        /* Match UMAC/Basilisk: one standard 800K Sony format.  A 400K image
+           is still bounded by Prime and remains readable through the same
+           block backend. */
+        ramWrite32(result, 2880U);
+        ramWrite32(result + 4U, 0xD2120050U);
+        return finishIo(parameterBlock, kNoErr);
     }
     case 8: /* drive status */
         for (uint32_t index = 0; index < 22U; ++index) {
             ramWrite8(parameterBlock + kCsParam + index,
                       ramRead8(floppy.status + index));
         }
-        return setDiskError(kNoErr);
+        return finishIo(parameterBlock, kNoErr);
     case 10: /* disk type / MFM information */
         ramWrite32(parameterBlock + kCsParam, 0x000000FEU);
-        return setDiskError(kNoErr);
+        return finishIo(parameterBlock, kNoErr);
     case 0x5343U: /* address header format */
         ramWrite8(parameterBlock + kCsParam, 0x02U);
-        return setDiskError(kNoErr);
+        return finishIo(parameterBlock, kNoErr);
     default:
-        return setDiskError(kStatusErr);
+        return finishIo(parameterBlock, kStatusErr);
     }
 }
 
